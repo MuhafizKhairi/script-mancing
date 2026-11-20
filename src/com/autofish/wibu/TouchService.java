@@ -36,7 +36,7 @@ public class TouchService extends AccessibilityService {
     private LinearLayout panel;
     private WindowManager.LayoutParams lp;
     private TextView statusTv, detTv;
-    private Button toggle;
+    private Button toggle, recBtn;
 
     // hold engine state (main thread only)
     private boolean wantHold, strokeActive, inFlight, alt;
@@ -46,6 +46,11 @@ public class TouchService extends AccessibilityService {
     @Override
     protected void onServiceConnected() {
         super.onServiceConnected();
+        if (!DevLock.allowed(this)) { // dev build on someone else's phone: do nothing
+            android.util.Log.i("AutoMancing", "Kode HP dev: " + DevLock.deviceCode(this));
+            disableSelf();
+            return;
+        }
         instance = this;
         main = new Handler(Looper.getMainLooper());
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
@@ -181,6 +186,33 @@ public class TouchService extends AccessibilityService {
         toggle.setOnClickListener(v -> onToggle());
         panel.addView(toggle, new LinearLayout.LayoutParams(dp(40), dp(36)));
 
+        if (Riwayat.ENABLED) {
+            // private build: "rekam semua" for studying new game mechanics (turns itself off after REC_MINUTES)
+            recBtn = new Button(this);
+            recBtn.setText("REC");
+            recBtn.setTextSize(10);
+            recBtn.setTextColor(Color.WHITE);
+            GradientDrawable rb = new GradientDrawable();
+            rb.setColor(0xFF455A64);
+            rb.setCornerRadius(dp(8));
+            recBtn.setBackground(rb);
+            recBtn.setMinWidth(0);
+            recBtn.setMinHeight(0);
+            recBtn.setMinimumWidth(0);
+            recBtn.setMinimumHeight(0);
+            recBtn.setPadding(dp(4), dp(2), dp(4), dp(2));
+            recBtn.setOnClickListener(v -> {
+                if (!Riwayat.ready()) {
+                    Prefs.log("Mulai rekam layar dulu");
+                    return;
+                }
+                Riwayat.setRecAll(!Riwayat.recAll());
+            });
+            LinearLayout.LayoutParams rl = new LinearLayout.LayoutParams(dp(40), dp(36));
+            rl.leftMargin = dp(4);
+            panel.addView(recBtn, rl);
+        }
+
         LinearLayout texts = new LinearLayout(this);
         texts.setOrientation(LinearLayout.VERTICAL);
         texts.setPadding(dp(8), 0, 0, 0);
@@ -244,6 +276,20 @@ public class TouchService extends AccessibilityService {
         cs.setActive(!cs.isActive());
     }
 
+    /** Where our panel is on screen (fractions; -1 = unknown): the detector ignores what it covers. */
+    static volatile float[] panelRect;
+    private final int[] loc = new int[2];
+    private final DisplayMetrics rdm = new DisplayMetrics();
+
+    private void publishPanelRect() {
+        if (panel == null || wm == null || panel.getWidth() == 0) return;
+        panel.getLocationOnScreen(loc);
+        wm.getDefaultDisplay().getRealMetrics(rdm);
+        float W = rdm.widthPixels, H = rdm.heightPixels;
+        if (W <= 0 || H <= 0) return;
+        panelRect = new float[]{loc[0] / W, loc[1] / H, (loc[0] + panel.getWidth()) / W, (loc[1] + panel.getHeight()) / H};
+    }
+
     private final Runnable updater = new Runnable() {
         @Override
         public void run() {
@@ -260,8 +306,14 @@ public class TouchService extends AccessibilityService {
             }
             statusTv.setText(st);
             detTv.setText(dt);
+            publishPanelRect();
             toggle.setText(active ? "■" : "▶");
             ((GradientDrawable) toggle.getBackground()).setColor(active ? 0xFFC62828 : 0xFF2E7D32);
+            if (recBtn != null) {
+                boolean rec = Riwayat.recAll();
+                recBtn.setText(rec ? "●" + Riwayat.recMinutesLeft() + "m" : "REC");
+                ((GradientDrawable) recBtn.getBackground()).setColor(rec ? 0xFFD32F2F : 0xFF455A64);
+            }
             main.postDelayed(this, 300);
         }
     };

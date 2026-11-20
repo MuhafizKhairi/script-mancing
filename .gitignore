@@ -2,3 +2,9 @@
 build/
 *.idsig
 debug.keystore
+riwayat/
+
+# versi dev: jangan pernah masuk git
+AutoMancing-dev.apk
+dev-devices.txt
+AutoMancing-pribadi.apk

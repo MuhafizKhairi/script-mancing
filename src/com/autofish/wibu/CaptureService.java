@@ -61,6 +61,10 @@ public class CaptureService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         startAsForeground();
+        if (!DevLock.allowed(this)) {
+            stopSelf();
+            return START_NOT_STICKY;
+        }
         if (projection != null) return START_NOT_STICKY;
         if (intent == null) {
             stopSelf();
@@ -77,6 +81,16 @@ public class CaptureService extends Service {
         if (projection == null) {
             stopSelf();
             return START_NOT_STICKY;
+        }
+        if (Riwayat.ENABLED) {
+            Riwayat.init(this);
+            String ver = "?";
+            try {
+                ver = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+            } catch (Exception ignored) {
+            }
+            Riwayat.newSession(ver + " " + Build.MANUFACTURER + " " + Build.MODEL + " android" + Build.VERSION.RELEASE
+                    + " " + new java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new java.util.Date()));
         }
         thread = new HandlerThread("capture");
         thread.start();
@@ -145,12 +159,30 @@ public class CaptureService extends Service {
                 fpsStart = t;
             }
             if (run) {
+                float[] pr = TouchService.panelRect;
+                if (pr != null) {
+                    bot.det.maskFy0 = pr[1];
+                    bot.det.maskFx1 = pr[2];
+                    bot.det.maskFy1 = pr[3];
+                    bot.det.maskFx0 = pr[0];
+                }
                 bot.onFrame(pixels, w, h, now);
                 debug = bot.det.describe() + String.format(Locale.US, "  %.0ffps", fps);
                 // diagnosis trace (logcat tag AMDbg, 8x per second during the minigame): what the bot sees + decides
-                if (bot.status.startsWith("Tarik") && now - lastDbgMs >= 125) {
+                boolean tarik = bot.status.startsWith("Tarik");
+                boolean rec = Riwayat.recAll();
+                if (tarik && now - lastDbgMs >= 125) {
                     lastDbgMs = now;
                     android.util.Log.d("AMDbg", (bot.isHolding() ? "HOLD " : "rel  ") + bot.status + " | " + bot.det.describe().replace('\n', ' ') + " | " + bot.dbg);
+                    if (Riwayat.ready() && !rec) Riwayat.line('F', traceLine());
+                }
+                if (Riwayat.ready()) {
+                    if (tarik && rec) Riwayat.line('F', traceLine()); // every frame
+                    // outside the minigame: one line whenever the button changes (Mancing -> Angkat -> Strike ...)
+                    if (bot.det.button != lastBtn && !tarik)
+                        Riwayat.line('S', bot.det.button + " " + bot.status + (bot.det.barFound ? " bar@" + bot.det.barX0 : ""));
+                    lastBtn = bot.det.button;
+                    recordHistory(w, h, now);
                 }
                 if (bot.stopped) {
                     active = false;
@@ -165,6 +197,107 @@ public class CaptureService extends Service {
         } finally {
             if (img != null) img.close();
         }
+    }
+
+    // ---- on-phone history (private build): photos of the moments that matter ----
+    private boolean wasInGame;
+    private int lastBtn = -1;
+    private int lastMisses, outShots;
+    private long blindSince = -1, resultAt = -1, lastPrevCopy;
+    private boolean blindShot, prevValid, stuckShot;
+    private int[] prevPx;
+
+    private final StringBuilder tsb = new StringBuilder(128);
+    private long lastRecPhoto;
+    private long gameStartT;
+
+    /** One compact "F" line (format: Riwayat.FORMAT). */
+    private String traceLine() {
+        Detector d = bot.det;
+        StringBuilder sb = tsb;
+        sb.setLength(0);
+        sb.append(bot.isHolding() ? 'H' : 'r').append(bot.status.startsWith("Tarik (bar tertutup") ? "b" : "")
+                .append(' ').append(d.button).append(' ');
+        if (d.barFound) {
+            sb.append(d.barX0).append(' ').append(d.barX1).append(' ').append(d.trackTop).append(' ').append(d.trackBot)
+                    .append(' ').append(d.zoneTop).append(' ').append(d.zoneBot).append(' ')
+                    .append(d.fishVisible ? String.valueOf(Math.round(d.fishY * 10)) : "-").append(' ');
+            int n = sb.length();
+            if (d.relMode) sb.append('R');
+            if (d.fishFromOutline) sb.append('P');
+            if (!d.fishVisible) sb.append('N');
+            if (!Float.isNaN(d.markerY)) sb.append('K').append(d.markerSide < 0 ? '-' : '+').append(Math.round(d.markerY));
+            if (d.warnDir < 0) sb.append('A');
+            if (d.warnDir > 0) sb.append('B');
+            if (d.gapFound) sb.append('C').append(d.gapTop).append('-').append(d.gapBot);
+            else if (d.skyMode) sb.append('L');
+            if (sb.length() == n) sb.append('.');
+        } else {
+            sb.append("- ").append(d.fail.trim().replace(' ', ','));
+            if (d.fail.trim().isEmpty()) sb.append('.');
+        }
+        sb.append(" | ");
+        bot.traceTail(sb);
+        return sb.toString();
+    }
+
+    /**
+     * Photos for the history. Normal mode: only problems (first time the fish leaves the zone + the frame 0.4 s
+     * before it, the bar unreadable for 0.5 s, the result of a non-perfect or long minigame). "Rekam semua": 5 photos
+     * per second in the minigame, 1 per second while a fishing button is visible (= the game is on screen).
+     */
+    private void recordHistory(int w, int h, long now) {
+        boolean inGame = bot.isInGame();
+        boolean rec = Riwayat.recAll();
+        String g = "g" + bot.minigames;
+        if (inGame && !wasInGame) {
+            lastMisses = 0;
+            outShots = 0;
+            blindShot = false;
+            blindSince = -1;
+            prevValid = false;
+            resultAt = -1;
+            gameStartT = now;
+        }
+        if (rec && (inGame || bot.det.button != Detector.BTN_NONE || resultAt > 0)
+                && now - lastRecPhoto >= (inGame ? 200 : 1000)) {
+            lastRecPhoto = now;
+            Riwayat.photo(pixels, w, h, inGame ? g : "x");
+        }
+        if (inGame) {
+            if (bot.perfectMisses > lastMisses && outShots < 1 && !rec) {
+                outShots++;
+                if (prevValid) Riwayat.photo(prevPx, w, h, g + "-keluar-a"); // what led to it
+                Riwayat.photo(pixels, w, h, g + "-keluar-b");
+            }
+            // (bar hidden while the Tarik button still shows; at the very end the result card hides both: not a problem)
+            if (bot.status.startsWith("Tarik (bar") && bot.det.button == Detector.BTN_TARIK) {
+                if (blindSince < 0) blindSince = now;
+                else if (now - blindSince > 500 && !blindShot && !rec) {
+                    blindShot = true;
+                    Riwayat.photo(pixels, w, h, g + "-buta");
+                }
+            } else blindSince = -1;
+            if (now - lastPrevCopy >= 400) {
+                if (prevPx == null || prevPx.length != w * h) prevPx = new int[w * h];
+                System.arraycopy(pixels, 0, prevPx, 0, w * h);
+                prevValid = true;
+                lastPrevCopy = now;
+            }
+        } else if (wasInGame && (bot.perfectMisses > 0 || now - gameStartT > 15000 || rec))
+            resultAt = now + 1200; // the catch card or "Lolos" is on screen by then
+        if (!inGame && resultAt > 0 && now >= resultAt) {
+            resultAt = -1;
+            Riwayat.photo(pixels, w, h, g + "-hasil");
+            Riwayat.trim();
+        }
+        // casting stuck (Mancing tapped again and again, never "Angkat"): one photo of what the screen shows
+        if (bot.mancingTaps >= 3 && !stuckShot && bot.det.button != Detector.BTN_NONE && !rec) {
+            stuckShot = true;
+            Riwayat.photo(pixels, w, h, "macet");
+        } else if (bot.mancingTaps == 0) stuckShot = false;
+        lastMisses = bot.perfectMisses;
+        wasInGame = inGame;
     }
 
     private void convert(Image img, int w, int h) {

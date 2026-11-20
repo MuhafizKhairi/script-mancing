@@ -40,6 +40,7 @@ final class Prefs {
         LOG.addFirst(FMT.format(new Date()) + "  " + msg);
         while (LOG.size() > 40) LOG.removeLast();
         android.util.Log.i("AutoMancing", msg);
+        Riwayat.event(msg);
     }
 
     static synchronized String logText() {

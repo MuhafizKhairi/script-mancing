@@ -30,7 +30,18 @@ public class MainActivity extends Activity {
     static final String CREDIT = "Aplikasi ini buatan Hae untuk mempermudah mancing di Wibu Fish.\n"
             + "Kalau menemukan bug atau punya usulan untuk aplikasi ini, silakan bilang ke Hae.";
 
-    private TextView accStatus, capStatus, logView;
+    private TextView accStatus, capStatus, logView, histSize;
+    private long lastSizeCheck;
+    private boolean locked;
+
+    private void updateHistSize() {
+        if (histSize == null) return;
+        lastSizeCheck = System.currentTimeMillis();
+        new Thread(() -> {
+            long b = Riwayat.sizeBytes();
+            ui.post(() -> histSize.setText(String.format(Locale.US, "Ukuran riwayat: %.1f MB", b / 1048576f)));
+        }).start();
+    }
     private EditText castDelay, maxWait, maxCasts, latency;
     private final Handler ui = new Handler(Looper.getMainLooper());
 
@@ -41,6 +52,21 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        if (!DevLock.allowed(this)) {
+            locked = true;
+            String code = DevLock.deviceCode(this);
+            android.util.Log.i("AutoMancing", "Kode HP dev: " + code);
+            TextView tv = new TextView(this);
+            int p = dp(24);
+            tv.setPadding(p, p, p, p);
+            tv.setTextSize(16);
+            tv.setText("Auto Mancing Dev\n\nVersi dev ini terkunci untuk HP pemiliknya, jadi tidak bisa dipakai di HP ini.\n"
+                    + "Pakai AutoMancing-publik.apk.\n\nKode HP: " + code);
+            tv.setTextIsSelectable(true);
+            setContentView(tv);
+            return;
+        }
+        Riwayat.init(this);
         ScrollView sv = new ScrollView(this);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -119,6 +145,34 @@ public class MainActivity extends Activity {
         save.setOnClickListener(v -> saveSettings());
         root.addView(save);
 
+        if (Riwayat.ENABLED) {
+            TextView rt = new TextView(this);
+            rt.setText("\nRiwayat (untuk cek bug)");
+            rt.setTextSize(18);
+            rt.setTypeface(Typeface.DEFAULT_BOLD);
+            root.addView(rt);
+            TextView ri = new TextView(this);
+            ri.setText("Bot mencatat log ringkas + foto saat ada masalah (ikan keluar zona, bar tidak terbaca, ikan lolos). "
+                    + "Tombol REC di panel = rekam semua selama " + Riwayat.REC_MINUTES + " menit (untuk mekanik baru). "
+                    + "Riwayat lebih dari 3 hari terhapus sendiri.");
+            root.addView(ri);
+            histSize = new TextView(this);
+            histSize.setPadding(0, dp(4), 0, 0);
+            root.addView(histSize);
+            Button del = new Button(this);
+            del.setText("Hapus riwayat");
+            del.setOnClickListener(v -> new AlertDialog.Builder(this)
+                    .setTitle("Hapus riwayat?")
+                    .setMessage("Semua log dan foto riwayat akan dihapus.")
+                    .setPositiveButton("Hapus", (dlg, which) -> Riwayat.deleteAll(() -> ui.post(() -> {
+                        Toast.makeText(this, "Riwayat dihapus", Toast.LENGTH_SHORT).show();
+                        updateHistSize();
+                    })))
+                    .setNegativeButton("Batal", null)
+                    .show());
+            root.addView(del);
+        }
+
         TextView lt = new TextView(this);
         lt.setText("\nLog");
         lt.setTextSize(18);
@@ -192,6 +246,7 @@ public class MainActivity extends Activity {
             capStatus.setText(capOn ? "✔ Rekam layar aktif" : "✘ Rekam layar belum aktif");
             capStatus.setTextColor(capOn ? 0xFF2E7D32 : Color.RED);
             logView.setText(Prefs.logText());
+            if (System.currentTimeMillis() - lastSizeCheck > 5000) updateHistSize();
             ui.postDelayed(this, 1000);
         }
     };
@@ -199,6 +254,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (locked) return;
         ui.post(refresh);
     }
 

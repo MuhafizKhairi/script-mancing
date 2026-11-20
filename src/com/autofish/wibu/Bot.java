@@ -69,6 +69,9 @@ public final class Bot {
     private int failedStarts, dismissTaps;
     private long lastGameEndMs = -1;
     private boolean sawCastProgress;
+    private long lastLepasSeenMs = -100000;
+    /** Mancing taps since the last "Angkat" (waiting for a bite): 3+ means casting is stuck. */
+    public int mancingTaps;
 
     // ---- minigame state ----
     private boolean inGame;
@@ -96,6 +99,10 @@ public final class Bot {
     /** After a "Pindah!" jump: the fish lands at this height (fraction of the track) - used while it is invisible. */
     private float landFrac = Float.NaN;
     private long landUntilMs;
+    /** Legendary "Rintangan!": steer the zone through the gap of the next fish wall (see Detector.findWall). */
+    private boolean rintangan;
+    private long gapSeenMs, gapHoldUntilMs;
+    private float gapC, gapHalf, gapWallX1;
     /** Frames where the fish stayed inside the zone vs. left it (for the "perfect catch" readout). */
     public int perfectMisses;
     private boolean lastInZone = true;
@@ -106,6 +113,9 @@ public final class Bot {
     private boolean inverted;
     private int invEvidence;
     private long pinSinceMs = -1;
+    /** Last inversion flip made by the "pinned against a wall" rule, and the direction before it. */
+    private long lastPinFlipMs = -1, pinBlockUntilMs = -1;
+    private boolean pinPrevInv;
     // window for physics evaluation
     private long winStartMs = -1;
     private float winStartV;
@@ -187,7 +197,13 @@ public final class Bot {
             return;
         }
         if (inGame) {
-            if (now - lastBarMs < 600 && btn == Detector.BTN_NONE) return; // brief flicker
+            // brief flicker; a long legendary fight switches scenes ("Rintangan!", "Ke darat!") behind a banner that
+            // can hide the button and the bar for over a second: do not end (and restart) it on that
+            long tol = now - gameStartMs > 8000 ? 1800 : 600;
+            if (now - lastBarMs < tol && btn == Detector.BTN_NONE) {
+                if (holding) setHold(false, now);
+                return;
+            }
             endGame(now);
         }
         if (holding) setHold(false, now);
@@ -206,6 +222,12 @@ public final class Bot {
 
         switch (btn) {
             case Detector.BTN_MANCING:
+                // right after a cast the button turns into a plain blue "..." disc (read as Mancing) for ~0.8 s, sometimes
+                // >1.5 s on lag; tapping it re-casts, and the bot looped Mancing -> Lepas -> "..." forever. Wait for it.
+                if (now - lastLepasSeenMs < 5000 && now - lastLepasSeenMs >= 0) {
+                    status = "Menunggu lemparan";
+                    break;
+                }
                 status = "Mulai mancing";
                 if (cfg.maxCasts > 0 && casts >= cfg.maxCasts) {
                     stop("sudah " + casts + " kali lempar");
@@ -222,6 +244,7 @@ public final class Bot {
                 }
                 break;
             case Detector.BTN_LEPAS:
+                lastLepasSeenMs = now;
                 sawCastProgress = true;
                 failedStarts = 0;
                 status = "Lempar umpan";
@@ -232,6 +255,8 @@ public final class Bot {
                 }
                 break;
             case Detector.BTN_ANGKAT:
+                lastLepasSeenMs = -100000;
+                mancingTaps = 0;
                 sawCastProgress = true;
                 failedStarts = 0;
                 if (angkatSinceMs < 0) angkatSinceMs = now;
@@ -264,6 +289,7 @@ public final class Bot {
     }
 
     private void tap(int btn, long now) {
+        if (btn == Detector.BTN_MANCING) mancingTaps++;
         act.tap(tx(), ty());
         lastTapMs = now;
         lastTapBtn = btn;
@@ -291,6 +317,8 @@ public final class Bot {
         inverted = false;
         invEvidence = 0;
         pinSinceMs = -1;
+        lastPinFlipMs = -1;
+        pinBlockUntilMs = -1;
         winStartMs = -1;
         cmdN = 0;
         fishHalf = -1;
@@ -298,6 +326,8 @@ public final class Bot {
         noBtnSinceMs = -1;
         lastTrackTop = lastTrackBot = -1;
         landFrac = Float.NaN;
+        rintangan = false;
+        gapHoldUntilMs = 0;
         act.log("Minigame #" + minigames + " mulai");
     }
 
@@ -338,7 +368,10 @@ public final class Bot {
         return c[n / 2];
     }
 
+    private long lastNow;
+
     private void control(long now) {
+        lastNow = now;
         Detector d = det;
         float trackH = Math.max(10, d.trackBot - d.trackTop);
         if (aUp <= 0) aUp = aDown = cfg.accel * trackH;
@@ -351,8 +384,11 @@ public final class Bot {
 
         // --- robust zone centre (the fish icon can hide one end of the zone) ---
         float hMeas = d.zoneBot - d.zoneTop;
-        hHist[hN % hHist.length] = hMeas;
-        hN++;
+        // (in the "Rintangan!" scene the glow and the gap line often stretch the reading: keep the known height)
+        if (!(rintangan && hN > 8 && hMeas > 1.2f * zoneH)) {
+            hHist[hN % hHist.length] = hMeas;
+            hN++;
+        }
         zoneH = medianHeight();
         float center = (d.zoneTop + d.zoneBot) / 2f;
         if (hN > 4 && Math.abs(hMeas - zoneH) > 0.12f * zoneH) {
@@ -489,13 +525,56 @@ public final class Bot {
         boolean effUp = lagHold != inverted;
         if ((atBot && effUp) || (atTop && !effUp)) {
             if (pinSinceMs < 0) pinSinceMs = now;
-            else if (now - pinSinceMs > 600 && now - gameStartMs > 1000) {
-                inverted = !inverted;
+            else if (now - pinSinceMs > 600 && now - gameStartMs > 1000 && now >= pinBlockUntilMs) {
+                if (lastPinFlipMs > 0 && now - lastPinFlipMs < 1600) {
+                    // still pinned after flipping: the zone does not respond either way (held/frozen by a boss
+                    // event), it is not "Balik!". Flipping back and forth every 0.7 s only sent the zone the wrong
+                    // way once it was free again, so restore the previous direction and wait.
+                    inverted = pinPrevInv;
+                    lastPinFlipMs = -1;
+                    pinBlockUntilMs = now + 2500;
+                    act.log("Zona tertahan di ujung (bukan Balik), kontrol " + (inverted ? "tetap terbalik" : "normal"));
+                } else {
+                    pinPrevInv = inverted;
+                    inverted = !inverted;
+                    lastPinFlipMs = now;
+                    act.log(inverted ? "Kontrol terbalik terdeteksi (Balik!)" : "Kontrol normal lagi");
+                }
                 invEvidence = 0;
                 pinSinceMs = -1;
-                act.log(inverted ? "Kontrol terbalik terdeteksi (Balik!)" : "Kontrol normal lagi");
             }
         } else pinSinceMs = -1;
+
+        // --- legendary "Rintangan!": walls of fish scroll into the bar; the zone must be inside the gap ---
+        if (d.gapFound) {
+            float c = (d.gapTop + d.gapBot) / 2f, hg = (d.gapBot - d.gapTop) / 2f;
+            // the nearest wall jumped far to the left = the previous wall is now passing over the bar: keep its gap
+            // until it is through (~0.3 s at the walls' speed), only then turn to the next one
+            if (rintangan && now - gapSeenMs < 400 && d.wallX1 < gapWallX1 - 60 && Math.abs(c - gapC) > 3)
+                gapHoldUntilMs = now + 320;
+            if (now >= gapHoldUntilMs) {
+                gapC = c;
+                gapHalf = hg;
+            }
+            gapWallX1 = d.wallX1;
+            gapSeenMs = now;
+            if (!rintangan) act.log("Rintangan: zona dibawa lewat celah tembok ikan");
+            rintangan = true;
+        } else if (rintangan && !d.skyMode && now - gapSeenMs > 1500) {
+            rintangan = false;
+            act.log("Rintangan selesai");
+        }
+        if (rintangan && now - gapSeenMs < 2500) {
+            float target = now - gapSeenMs < 700 || now < gapHoldUntilMs ? gapC : (d.trackTop + d.trackBot) / 2f;
+            float g = now - gapSeenMs < 700 ? Math.max(1f, gapHalf - zoneH / 2f - 2f) : Math.max(2f, 0.15f * trackH);
+            lastLead = 0;
+            boolean hold = decide(target, 0, 0, g);
+            setHold(hold, now);
+            lastInZone = true; // the fish is not what counts in this phase
+            status = String.format(java.util.Locale.US, "Tarik %s%s  [rintangan] celah %.0f-%.0f", hold ? "TAHAN" : "lepas",
+                    inverted ? " [terbalik]" : "", gapC - gapHalf, gapC + gapHalf);
+            return;
+        }
 
         // --- time-optimal bang-bang on the predicted state ---
         // While a dash is announced, aim the zone so the fish sits near the edge facing AWAY from the warned end:
@@ -513,6 +592,7 @@ public final class Bot {
             lead = Math.max(-maxP, Math.min(maxP, target - fy));
         }
         // the dash lead deliberately sits near the edge (legendary only, the game tolerates it): no guard then
+        lastLead = lead;
         boolean hold = decide(fy, vf, lead, activeWarn == 0 ? guardOf(slack) : Float.MAX_VALUE);
         setHold(hold, now);
 
@@ -539,7 +619,9 @@ public final class Bot {
      * leave through an end of the zone and is not already coming back, push the zone toward it. Returns the hold state.
      */
     private boolean decide(float fish, float fishV, float lead, float guard) {
-        float L = cfg.latency;
+        // The first ~0.9 s overshot in 3 of 3 logged near-misses (zone rising past a fish that starts drifting
+        // down; the first press reacts later than the rest): predict further ahead until the physics is measured.
+        float L = cfg.latency + (lastNow - gameStartMs < 900 ? 0.08f : 0f);
         float relV = vz - fishV;
         float zP = zc + vz * L, fP = fish + fishV * (L + cfg.fishLead);
         float x = zP - (fP + lead); // >0: zone is below the target
@@ -560,6 +642,7 @@ public final class Bot {
 
     /** Bar hidden by an effect: advance the zone model with our own (delayed) commands and keep steering. */
     private void blindControl(long now) {
+        lastNow = now;
         float dt = prevMs < 0 ? 0 : Math.min(0.1f, (now - prevMs) / 1000f);
         prevMs = now;
         boolean effUp = holdAt(now - (long) (cfg.latency * 1000)) != inverted;
@@ -588,8 +671,25 @@ public final class Bot {
             vf *= (float) Math.exp(-dt / 0.5);
         }
         float fh = fishHalf > 0 ? fishHalf : 0.07f * trackH;
-        setHold(decide(fy, vf, 0, guardOf(Math.max(2f, zoneH / 2f - fh))), now);
+        lastLead = 0;
+        if (rintangan && now - gapSeenMs < 700) // a wall over the bar hides it: keep the zone in that wall's gap
+            setHold(decide(gapC, 0, 0, Math.max(1f, gapHalf - zoneH / 2f - 2f)), now);
+        else setHold(decide(fy, vf, 0, guardOf(Math.max(2f, zoneH / 2f - fh))), now);
         status = "Tarik (bar tertutup efek, kendali perkiraan)";
+    }
+
+    private float lastLead;
+
+    /** Compact controller state for the on-phone history: "zc vz fy*10 vf lead inv warn mark". */
+    void traceTail(StringBuilder sb) {
+        sb.append(Math.round(zc)).append(' ').append(Math.round(vz)).append(' ').append(Math.round(fy * 10)).append(' ')
+                .append(Math.round(vf)).append(' ').append(Math.round(lastLead)).append(' ').append(inverted ? 1 : 0)
+                .append(' ').append(activeWarn).append(' ')
+                .append(Float.isNaN(markerFrac) ? "-" : String.valueOf(Math.round(markerFrac * 100)));
+    }
+
+    public boolean isInGame() {
+        return inGame;
     }
 
     public boolean isHolding() {

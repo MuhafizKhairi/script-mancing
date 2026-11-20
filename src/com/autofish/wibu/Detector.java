@@ -70,6 +70,8 @@ public final class Detector {
 
     private boolean memValid;
     private int memX0, memX1, memTop, memBot;
+    /** Track length of the last bar read with both ends visible (kept across minigames; all bars share it). */
+    private int knownTrackH = -1;
 
     /** Forget the remembered track position (call when a minigame ends). */
     public void resetMemory() {
@@ -318,13 +320,198 @@ public final class Detector {
         return b >= g - 8 && g - r >= 50 && b > 90;
     }
 
+    /** Are most rows y0..y1 covered by the fish (dark, faded grey, or white glare) rather than empty track? */
+    private static boolean gapIsFish(int[] px, int w, int x0, int x1, int y0, int y1) {
+        int cw = x1 - x0 + 1, fishy = 0;
+        int[] xs = {x0 + cw / 4, (x0 + x1) / 2, x1 - cw / 4};
+        for (int y = y0; y <= y1; y++) {
+            int n = 0;
+            for (int x : xs) {
+                int c = px[y * w + x];
+                int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+                if (isDark(r, g, b) || isGhost(r, g, b) || isEdge(r, g, b)) n++;
+            }
+            if (n >= 2) fishy++;
+        }
+        return fishy * 2 >= y1 - y0 + 1;
+    }
+
+    /** Empty track: neither zone nor fish (teal, or the zone's fading glow). */
+    private static boolean plainAt(int[] px, int w, int h, int x, int y) {
+        if (y < 0 || y >= h) return false;
+        int c = px[y * w + x];
+        int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+        return !isZone(r, g, b) && !isDark(r, g, b) && !isEdge(r, g, b);
+    }
+
+    /**
+     * Our own floating panel as fractions of the screen (set by the app, -1 = unknown). It is captured with the game
+     * and darkens whatever it covers (the far-left "Pindah!" bars run under it): those pixels are ignored.
+     */
+    public volatile float maskFx0 = -1, maskFy0, maskFx1, maskFy1;
+    private int mX0 = -1, mY0, mX1, mY1;
+
+    private boolean masked(int x, int y) {
+        return mX0 >= 0 && x >= mX0 && x <= mX1 && y >= mY0 && y <= mY1;
+    }
+
     public void analyze(int[] px, int w, int h) {
+        float f0 = maskFx0;
+        if (f0 >= 0) {
+            mX0 = (int) (f0 * w) - 2;
+            mY0 = (int) (maskFy0 * h) - 2;
+            mX1 = (int) (maskFx1 * w) + 2;
+            mY1 = (int) (maskFy1 * h) + 2;
+        } else mX0 = -1;
         classifyButton(px, w, h);
         findBar(px, w, h);
         relMode = false;
         // Map events (Aurora, red, rainbow, purple ...) tint the bar so fixed colours no longer match.
         // During the minigame, fall back to reading the bar at its known position with relative comparisons.
         if (!barFound && button == BTN_TARIK) findBarRelative(px, w, h);
+        skyMode = gapFound = false;
+        if (barFound) findWall(px, w, h);
+    }
+
+    // ------------------------------------------------------------------ legendary "Rintangan!" (fish walls)
+    /**
+     * Legendary phase "Rintangan! Lewati celah tembok ikan": the scene turns into a sky, and walls (columns of fish
+     * icons on dark teal, cream caps at the gap) scroll from the left into the bar. When a wall reaches the bar the
+     * ZONE must be inside its gap ("TURUN/NAIK/PAS!" is drawn at the zone's height; a hit costs "Tali -2..3%").
+     * skyMode = the sky scene is behind the bar; gapFound = the nearest wall left of the bar and its open gap (px).
+     */
+    public boolean skyMode, gapFound;
+    public int wallX0, wallX1, gapTop, gapBot;
+
+    static boolean isSky(int r, int g, int b) {
+        return r >= 75 && r <= 140 && g >= 165 && b >= 180 && b - r >= 55;
+    }
+
+    static boolean isCloud(int r, int g, int b) {
+        return r >= 170 && g >= 205 && b >= 195 && b >= r + 8 && g >= r + 12;
+    }
+
+    static boolean isWallTeal(int r, int g, int b) {
+        return r <= 75 && g >= 55 && g <= 130 && b >= 60 && b <= 145 && g - r >= 25 && Math.abs(b - g) <= 30;
+    }
+
+    static boolean isCap(int r, int g, int b) {
+        return r >= 225 && g >= 210 && b >= 165 && b <= 225 && r - b >= 25;
+    }
+
+    private final int[] wallCol = new int[4096];
+
+    private void findWall(int[] px, int w, int h) {
+        int y0 = trackTop, y1 = trackBot, th = y1 - y0;
+        int xs = Math.max(2, (int) (0.012f * w)), xe = barX0 - 6;
+        if (xe - xs < 0.1f * w || th < 20 || xe >= wallCol.length) return;
+        int sky = 0, tot = 0;
+        for (int y = y0; y <= y1; y += 3)
+            for (int x = xs; x <= xe; x += 3) {
+                int c = px[y * w + x];
+                int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+                tot++;
+                if (isSky(r, g, b) || isCloud(r, g, b)) sky++;
+            }
+        if (sky < 0.30f * tot) return;
+        skyMode = true;
+        int need = Math.max(4, (int) (0.12f * th));
+        for (int x = xs; x <= xe; x++) {
+            int n = 0;
+            for (int y = y0; y <= y1; y++) {
+                int c = px[y * w + x];
+                if (isWallTeal((c >> 16) & 255, (c >> 8) & 255, c & 255)) n++;
+            }
+            wallCol[x] = n;
+        }
+        // nearest wall to the bar first; one that is just reaching the bar may be cut off at xe (keep >= 4 columns)
+        int minWall = Math.max(8, (int) (0.02f * w)), maxWall = (int) (0.10f * w);
+        int x = xe;
+        while (x >= xs) {
+            if (wallCol[x] < need) {
+                x--;
+                continue;
+            }
+            int b = x, a = x, gap = 0;
+            while (x >= xs) {
+                if (wallCol[x] >= need) {
+                    a = x;
+                    gap = 0;
+                } else if (++gap > 6) break;
+                x--;
+            }
+            int ww = b - a + 1;
+            boolean cut = b >= xe - 1;
+            if (ww > maxWall || (ww < minWall && !(cut && ww >= 4))) continue;
+            // the nearest real wall decides: if its gap is unreadable, a farther wall's gap must not be used
+            if (wallGap(px, w, h, a, b, y0, y1)) {
+                wallX0 = a;
+                wallX1 = b;
+                gapFound = true;
+            }
+            return;
+        }
+    }
+
+    private final byte[] rowCls = new byte[2048];
+
+    /** Open rows (sky/cloud) inside the wall's columns between hard rows (dark teal body, cream cap). */
+    private boolean wallGap(int[] px, int w, int h, int a, int b, int y0, int y1) {
+        int ia = b - a >= 8 ? a + 2 : a, ib = b - a >= 8 ? b - 2 : b, cw = ib - ia + 1;
+        if (y1 - y0 + 1 > rowCls.length) return false;
+        for (int y = y0; y <= y1; y++) {
+            int open = 0, teal = 0, cap = 0;
+            for (int x = ia; x <= ib; x++) {
+                int c = px[y * w + x];
+                int r = (c >> 16) & 255, g = (c >> 8) & 255, bl = c & 255;
+                if (isSky(r, g, bl) || isCloud(r, g, bl)) open++;
+                else if (isWallTeal(r, g, bl)) teal++;
+                else if (isCap(r, g, bl)) cap++;
+            }
+            // 0 = soft (fish icon, text, our own panel), 1 = open, 2 = hard
+            if (masked(ia, y) || masked(ib, y)) {
+                rowCls[y - y0] = 0;
+                continue;
+            }
+            rowCls[y - y0] = (byte) (open >= 0.5f * cw ? 1 : teal >= 0.35f * cw || cap >= 0.5f * cw ? 2 : 0);
+        }
+        int n = y1 - y0 + 1, bridge = Math.max(4, (int) (0.05f * h));
+        // short soft stretches between open rows are text ("TURUN", "PAS!") over the gap
+        for (int i = 0; i < n; i++) {
+            if (rowCls[i] != 0) continue;
+            int e = i;
+            while (e + 1 < n && rowCls[e + 1] == 0) e++;
+            if (i > 0 && e + 1 < n && rowCls[i - 1] == 1 && rowCls[e + 1] == 1 && e - i + 1 <= bridge)
+                for (int k = i; k <= e; k++) rowCls[k] = 1;
+            i = e;
+        }
+        int best = 0, bs = -1;
+        for (int i = 0; i < n; i++) {
+            if (rowCls[i] != 1) continue;
+            int e = i;
+            while (e + 1 < n && rowCls[e + 1] == 1) e++;
+            if (e - i + 1 > best) {
+                best = e - i + 1;
+                bs = i;
+            }
+            i = e;
+        }
+        if (best < 0.10f * h) return false;
+        int be = bs + best - 1;
+        // both ends must be real wall (or the track end), not a long soft stretch (e.g. our panel covering it)
+        // (a few soft rows of anti-aliasing at the cap are fine)
+        int k = bs - 1;
+        while (k >= 0 && k >= bs - 5 && rowCls[k] == 0) k--;
+        if (k >= 0 && rowCls[k] != 2) return false;
+        if (k < 0 && bs > 5) return false;
+        k = be + 1;
+        while (k < n && k <= be + 5 && rowCls[k] == 0) k++;
+        if (k < n && rowCls[k] != 2) return false;
+        if (k >= n && be < n - 6) return false;
+        if (bs == 0 && be == n - 1) return false; // no wall body at all
+        gapTop = y0 + bs;
+        gapBot = y0 + be;
+        return true;
     }
 
     // ------------------------------------------------------------------ button
@@ -405,6 +592,8 @@ public final class Detector {
     }
 
     private float foundCx, foundCy;
+    /** Centre of the last button whose ring was found (the button stays put). */
+    private float lastRingCx, lastRingCy, lastRingR = -1;
 
     private int classOf(int c) {
         int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
@@ -510,10 +699,56 @@ public final class Detector {
             cx = mxs / consistent;
             cy = mys / consistent;
         }
+        if (!ok && lastRingR > 0 && Math.abs(lastRingCx - cx) < 0.2f * h && Math.abs(lastRingCy - cy) < 0.2f * h) {
+            // the button never moves: green grass behind it drags the colour centroid away, use where it last was
+            cx = lastRingCx;
+            cy = lastRingCy;
+        }
+        if (!ok) {
+            // Light background (the legendary "Rintangan!" sky, clouds, sand): scanning in from outside hits the
+            // background before the ring. Scan outwards instead: the ring is the first white right after the
+            // button's own colour (white text inside is followed by more colour, not by the end of the button).
+            final int RAYS = 12;
+            float[] rad = new float[RAYS];
+            int hits = 0;
+            for (int k = 0; k < RAYS; k++) {
+                double a = 2 * Math.PI * k / RAYS;
+                double ux = Math.cos(a), uy = Math.sin(a);
+                int run = 0;
+                for (float d = rr * 0.55f; d <= rr * 1.6f; d += 1f) {
+                    int x = (int) Math.round(cx + ux * d), y = (int) Math.round(cy + uy * d);
+                    if (x < 0 || y < 0 || x >= w || y >= h) break;
+                    int c = px[y * w + x];
+                    int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+                    int mx = Math.max(r, Math.max(g, b)), mn = Math.min(r, Math.min(g, b));
+                    boolean white = mn > 200 && mx - mn < 45, arc = r > 230 && g >= 182 && g <= 228 && b < 115;
+                    if ((white || arc) && run >= 3) {
+                        rad[hits++] = d;
+                        break;
+                    }
+                    run = classOf(c) == cls ? run + 1 : 0;
+                }
+            }
+            if (DEBUG) System.out.printf("  [btn inside-out c=%.0f,%.0f rr=%.0f hits=%d %s]%n", cx, cy, rr, hits, java.util.Arrays.toString(java.util.Arrays.copyOf(rad, hits)));
+            // (grass behind the button has the button's green, so part of the ring can be missing there)
+            if (hits >= 7) {
+                float[] sr = java.util.Arrays.copyOf(rad, hits);
+                java.util.Arrays.sort(sr);
+                med = sr[hits / 2];
+                consistent = 0;
+                for (int k = 0; k < hits; k++) if (Math.abs(rad[k] - med) <= Math.max(3f, 0.18f * med)) consistent++;
+                ok = consistent >= 7 && med >= rr * 0.7f;
+            }
+        }
         if (DEBUG) System.out.printf("  [btn cls=%d fill=%.2f ringR=%.0f consistent=%d -> %s]%n", cls, inside / (float) samples, med, consistent, ok);
         if (ok) {
             foundCx = cx;
             foundCy = cy;
+            if (med > 0) {
+                lastRingCx = cx;
+                lastRingCy = cy;
+                lastRingR = med;
+            }
         }
         return ok;
     }
@@ -563,22 +798,30 @@ public final class Detector {
         if (colCount.length < w) colCount = new int[w];
         if (rowFlag.length < h) rowFlag = new int[h];
         if (ghostRow.length < h) ghostRow = new int[h];
-        int xs = (int) (0.15f * w), xe = (int) Math.min(w - 1, w - 0.30f * h); // stay left of the action button
+        int xs = (int) (0.04f * w), xe = (int) Math.min(w - 1, w - 0.30f * h); // stay left of the action button
         int ys = (int) (0.06f * h), ye = (int) (0.96f * h);
 
-        for (int x = xs; x <= xe; x++) {
-            int cnt = 0;
-            for (int y = ys; y <= ye; y += 2) {
-                int c = px[y * w + x];
-                if (isZone((c >> 16) & 255, (c >> 8) & 255, c & 255)) cnt++;
-            }
-            colCount[x] = cnt;
-        }
         int minCol = Math.max(3, (int) (0.035f * h / 2));
-        int minW = Math.max(4, (int) (0.015f * w)), maxW = (int) (0.10f * w);
+        int minW = Math.max(4, (int) (0.015f * w)), maxW = (int) Math.min(0.10f * w, 0.14f * h); // real bar ~0.06-0.075 h wide
+        // Rows where zone-green runs across much more than one bar are background (the grass strip of the legendary
+        // "Rintangan!" sky scene): counted, it joins every column into one cluster far too wide to be the bar.
+        java.util.Arrays.fill(colCount, xs, xe + 1, 0);
+        int bgRow = (int) (1.5f * maxW);
+        for (int y = ys; y <= ye; y += 2) {
+            int row = y * w, n = 0;
+            for (int x = xs; x <= xe; x++) {
+                int c = px[row + x];
+                if (isZone((c >> 16) & 255, (c >> 8) & 255, c & 255)) n++;
+            }
+            if (n == 0 || n > bgRow) continue;
+            for (int x = xs; x <= xe; x++) {
+                int c = px[row + x];
+                if (isZone((c >> 16) & 255, (c >> 8) & 255, c & 255)) colCount[x]++;
+            }
+        }
 
         // collect column clusters, evaluate best-scoring first
-        int[][] clusters = new int[16][3];
+        int[][] clusters = new int[48][3];
         int nc = 0;
         int x = xs;
         while (x <= xe && nc < clusters.length) {
@@ -631,13 +874,29 @@ public final class Detector {
             }
             rowFlag[y] = cnt >= need ? 1 : 0;
         }
+        // "Rintangan!" draws a thin green line across the track (edge of the next gap); with teal on both sides it
+        // is not the zone and would stretch it (joined within maxGap). Rows next to the dark fish are kept.
+        {
+            int mx = (cx0 + cx1) / 2;
+            for (int y = ys; y <= ye; y++) {
+                if (rowFlag[y] == 0 || (y > ys && rowFlag[y - 1] == 1)) continue;
+                int e = y;
+                while (e + 1 <= ye && rowFlag[e + 1] == 1) e++;
+                if (e - y + 1 <= 3 && plainAt(px, w, h, mx, y - 2) && plainAt(px, w, h, mx, y - 3)
+                        && plainAt(px, w, h, mx, e + 2) && plainAt(px, w, h, mx, e + 3))
+                    for (int k = y; k <= e; k++) rowFlag[k] = 0;
+                y = e;
+            }
+        }
         // biggest group of zone rows, allowing gaps (the fish icon overlaps the zone)
         int maxGap = (int) (0.14f * h);
         int bestTop = -1, bestBot = -1, bestRows = 0;
         int gTop = -1, gBot = -1, gRows = 0;
         for (int y = ys; y <= ye; y++) {
             if (rowFlag[y] == 0) continue;
-            if (gTop >= 0 && y - gBot <= maxGap) {
+            // join across a gap only when it is the fish lying over the zone (or a thin line); a stretch of empty
+            // track means a separate green patch (the glow around a legendary fish, the "Rintangan!" gap line)
+            if (gTop >= 0 && y - gBot <= maxGap && (y - gBot <= 5 || gapIsFish(px, w, cx0, cx1, gBot + 1, y - 1))) {
                 gBot = y;
                 gRows++;
             } else {
@@ -664,6 +923,7 @@ public final class Detector {
         int limit = (int) (0.85f * h);
         int tTop = scanEdge(px, w, h, cx, bestTop, -1, limit);
         int tBot = scanEdge(px, w, h, cx, bestBot, +1, limit);
+        int sTop = tTop, sBot = tBot;
         // The fish icon can cover the outline at the very top/bottom. The track does not change size
         // during one minigame, so fall back to the remembered bounds when this looks wrong.
         if (memValid && Math.abs(cx - (memX0 + memX1) / 2) <= Math.max(3, cw / 2)) {
@@ -673,9 +933,23 @@ public final class Detector {
             if (bestTop < tTop) bestTop = tTop;
             if (bestBot > tBot) bestBot = tBot;
         }
+        // One end hidden (the fish at the very end, or our own panel over a far-left "Pindah!" bar) and this is a
+        // different bar than the remembered one: all bars have the same track length, so take it from the other end.
+        if ((tTop < 0) != (tBot < 0) && knownTrackH > 0) {
+            if (tTop < 0) tTop = tBot - knownTrackH;
+            else tBot = tTop + knownTrackH;
+            if (tTop < 1 || tBot >= h - 1) return fail("e2@%d-%d", cx0, cx1);
+            // (green background above/below the bar can join the zone through the fish lying on the track end)
+            bestTop = Math.max(bestTop, tTop);
+            bestBot = Math.min(bestBot, tBot);
+            if (bestBot - bestTop < 0.03f * h) return fail("e2@%d-%d", cx0, cx1);
+        }
         if (tTop < 0 || tBot < 0) return fail("e2@%d-%d", cx0, cx1);
         int th = tBot - tTop;
         if (th < 0.28f * h || th > 0.85f * h) return fail("e3@%d-%d", cx0, cx1);
+        // the real bar has a cream outline running down BOTH sides of the track; green grass next to teal water
+        // (the beach on the left of the screen) can pass every colour test above but never has it
+        if (!sideOutlines(px, w, cx0, cx1, tTop, tBot)) return fail("e10@%d-%d", cx0, cx1);
 
         // the rest of the track (outside the zone and the fish) must be mostly teal
         int teal = 0, other = 0;
@@ -699,7 +973,7 @@ public final class Detector {
             for (int x = fx0; x <= fx1; x++) {
                 int c = px[y * w + x];
                 int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
-                if (isDark(r, g, b)) rowCnt++;
+                if (isDark(r, g, b) && !masked(x, y)) rowCnt++;
                 else if (x >= cx0 && x <= cx1 && isGhost(r, g, b)) rowG++;
             }
             if (rowCnt > 0) {
@@ -763,12 +1037,12 @@ public final class Detector {
             for (int y = Math.max(0, tTop - ext); y < tTop; y++)
                 for (int x = cx0; x <= cx1; x++) {
                     int c = px[y * w + x];
-                    if (isDark((c >> 16) & 255, (c >> 8) & 255, c & 255)) beyond++;
+                    if (isDark((c >> 16) & 255, (c >> 8) & 255, c & 255) && !masked(x, y)) beyond++;
                 }
             for (int y = tBot + 1; y <= Math.min(h - 1, tBot + ext); y++)
                 for (int x = cx0; x <= cx1; x++) {
                     int c = px[y * w + x];
-                    if (isDark((c >> 16) & 255, (c >> 8) & 255, c & 255)) beyond++;
+                    if (isDark((c >> 16) & 255, (c >> 8) & 255, c & 255) && !masked(x, y)) beyond++;
                 }
             if (beyond >= minFish) return fail("e9@%d-%d", cx0, cx1);
         }
@@ -791,6 +1065,8 @@ public final class Detector {
         memX1 = cx1;
         memTop = tTop;
         memBot = tBot;
+        // (only from a frame where both ends were really scanned, not remembered or inferred)
+        if (sTop == tTop && sBot == tBot && fBot < tBot - 3 && fTop > tTop + 3) knownTrackH = tBot - tTop;
         // keep the HOME bar as the reference for the tint fallback: the "Pindah!" bar one pitch to the left is not it
         int pitchNow = barPitch(cw);
         // Only learn the reference geometry from a real minigame bar: outside the minigame (catch card, Mancing
@@ -816,6 +1092,30 @@ public final class Detector {
         return true;
     }
 
+    /** Fraction of track rows with an outline pixel just left AND just right of the zone columns. */
+    public float lastSideFrac;
+
+    private boolean sideOutlines(int[] px, int w, int cx0, int cx1, int tTop, int tBot) {
+        int rows = 0, both = 0;
+        for (int y = tTop + 2; y <= tBot - 2; y += 2) {
+            if (masked(cx0, y) || masked(cx1, y)) continue;
+            boolean l = false, r = false;
+            for (int x = Math.max(0, cx0 - 5); x <= cx0 && !l; x++) {
+                int c = px[y * w + x];
+                l = isEdge((c >> 16) & 255, (c >> 8) & 255, c & 255);
+            }
+            for (int x = cx1; x <= Math.min(w - 1, cx1 + 5) && !r; x++) {
+                int c = px[y * w + x];
+                r = isEdge((c >> 16) & 255, (c >> 8) & 255, c & 255);
+            }
+            rows++;
+            if (l && r) both++;
+        }
+        lastSideFrac = rows == 0 ? 0 : both / (float) rows;
+        // the fish icon and speech bubbles cover the outline over part of the track
+        return lastSideFrac >= 0.45f;
+    }
+
     private boolean fail(String f, int a, int b) {
         fail = fail + String.format(f, a, b) + " ";
         return false;
@@ -829,12 +1129,15 @@ public final class Detector {
         return (r * 3 + g * 6 + b) / 10 > 160 && mx - mn < 75 && r >= b - 10;
     }
 
-    private static int scanEdge(int[] px, int w, int h, int x, int startY, int dir, int limit) {
+    private int scanEdge(int[] px, int w, int h, int x, int startY, int dir, int limit) {
         int need = Math.max(2, h / 150);
         int run = 0, lastInside = startY;
         for (int i = 0, y = startY; i <= limit && y >= 0 && y < h; i++, y += dir) {
+            if (masked(x, y)) return -1; // our own panel covers this end: unknown
             int c = px[y * w + x];
-            if (isEdge((c >> 16) & 255, (c >> 8) & 255, c & 255)) {
+            int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+            // (the legendary dash warning is a pale yellow line 2 rows thick just inside the track end: not the outline)
+            if (isEdge(r, g, b) && !isWarnYellow(r, g, b)) {
                 if (++run >= need) {
                     // a highlight line inside the track is followed by more teal track; the real outline is not
                     int teal = 0;
@@ -987,7 +1290,7 @@ public final class Detector {
         int cnt = 0, fTop = -1, fBot = -1, curCnt = 0, curTop = -1, curBot = -1, lastY = -100;
         for (int y = tTop; y <= tBot + 4; y++) {
             int rc = 0;
-            if (y <= tBot) for (int x = fx0; x <= fx1; x++) if (luma(px[y * w + x]) < darkT) rc++;
+            if (y <= tBot) for (int x = fx0; x <= fx1; x++) if (luma(px[y * w + x]) < darkT && !masked(x, y)) rc++;
             if (rc >= 2) {
                 if (y - lastY > 4) {
                     if (curCnt > cnt) { cnt = curCnt; sumY = curSum; fTop = curTop; fBot = curBot; }
@@ -1180,6 +1483,8 @@ public final class Detector {
                     .append(" n=").append(fishCount).append(fishFromOutline ? " PUDAR" : "");
             if (!Float.isNaN(markerY)) sb.append(" PINDAH").append(markerSide < 0 ? "-KIRI@" : "-KANAN@").append((int) markerY);
             if (warnDir != 0) sb.append(warnDir > 0 ? " AWAS-BAWAH" : " AWAS-ATAS");
+            if (gapFound) sb.append(" CELAH@").append(wallX0).append('-').append(wallX1).append(':').append(gapTop).append('-').append(gapBot);
+            else if (skyMode) sb.append(" LANGIT");
         } else sb.append(" bar=none ").append(fail);
         return sb.toString();
     }
