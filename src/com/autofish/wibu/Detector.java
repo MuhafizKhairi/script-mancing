@@ -72,6 +72,27 @@ public final class Detector {
     private int memX0, memX1, memTop, memBot;
     /** Track length of the last bar read with both ends visible (kept across minigames; all bars share it). */
     private int knownTrackH = -1;
+    /**
+     * Votes for the track length from fully scanned frames. One misread used to set knownTrackH for good (2026-11-21:
+     * 130 from one bad frame of a legendary fight, real 144); in the dimmed "Aurora" scene the top outline is too
+     * dark to scan, the top was inferred 13 px too low and the zone clamped to it. Now the most common length wins.
+     */
+    private int[] thVotes = new int[0];
+
+    private void learnTrackH(int th, int h) {
+        if (th < 0.30f * h || th > 0.85f * h) return;
+        if (thVotes.length != h) thVotes = new int[h];
+        if (++thVotes[th] > 300) for (int i = 0; i < h; i++) thVotes[i] /= 2; // slowly forget old bars
+        int best = -1, bestV = 0;
+        for (int i = 1; i < h - 1; i++) {
+            int v = thVotes[i - 1] + 2 * thVotes[i] + thVotes[i + 1];
+            if (v > bestV) {
+                bestV = v;
+                best = i;
+            }
+        }
+        if (bestV >= 6) knownTrackH = best; // (a few frames agree)
+    }
 
     /** Forget the remembered track position (call when a minigame ends). */
     public void resetMemory() {
@@ -945,8 +966,35 @@ public final class Detector {
             if (bestBot - bestTop < 0.03f * h) return fail("e2@%d-%d", cx0, cx1);
         }
         if (tTop < 0 || tBot < 0) return fail("e2@%d-%d", cx0, cx1);
+        // Both ends "found" but the length is wrong: one end is false. Seen 2026-11-21 in the legendary "Ke darat!"
+        // scene: the ground at the bottom gave a false bottom edge that crept up a few px per frame (each step within
+        // the memory tolerance) from 224 to 195 and stayed there for 20 s. Keep the end that matches the memory and
+        // put the other one at the known length; without a memory do not learn from this frame.
+        boolean lenOk = true;
+        if (knownTrackH > 0 && Math.abs((tBot - tTop) - knownTrackH) > Math.max(4, 0.015f * h)) {
+            lenOk = false;
+            if (memValid && Math.abs(cx - (memX0 + memX1) / 2) <= Math.max(3, cw / 2)) {
+                if (Math.abs(tTop - memTop) <= Math.abs(tBot - memBot)) tBot = tTop + knownTrackH;
+                else tTop = tBot - knownTrackH;
+                if (tTop < 1 || tBot >= h - 1) return fail("e2@%d-%d", cx0, cx1);
+                bestTop = Math.max(bestTop, tTop);
+                bestBot = Math.min(bestBot, tBot);
+                if (bestBot - bestTop < 0.03f * h) return fail("e2@%d-%d", cx0, cx1);
+            }
+        }
         int th = tBot - tTop;
         if (th < 0.28f * h || th > 0.85f * h) return fail("e3@%d-%d", cx0, cx1);
+        // Dimmed scenes ("Aurora" darkens the whole screen ~15%): the zone has a vertical gradient and only its
+        // brighter lower part still passes isZone, so the zone read 10-40 px too short (seen 2026-11-21: height 53
+        // -> median 40, sometimes 11) and the bot kept holding while the real zone rose past the fish. Inside the
+        // track, grow the zone over rows that are dimmer zone-green (and across the fish lying on it).
+        if (bestTop > tTop + 1 || bestBot < tBot - 1) {
+            int ext0 = bestTop, ext1 = bestBot;
+            bestTop = growZone(px, w, cx0, cx1, bestTop, tTop + 1, -1, need, (int) (0.14f * h));
+            bestBot = growZone(px, w, cx0, cx1, bestBot, tBot - 1, +1, need, (int) (0.14f * h));
+            if (DEBUG && (ext0 != bestTop || ext1 != bestBot))
+                System.out.printf("  [zone grown %d-%d -> %d-%d]%n", ext0, ext1, bestTop, bestBot);
+        }
         // the real bar has a cream outline running down BOTH sides of the track; green grass next to teal water
         // (the beach on the left of the screen) can pass every colour test above but never has it
         if (!sideOutlines(px, w, cx0, cx1, tTop, tBot)) return fail("e10@%d-%d", cx0, cx1);
@@ -1060,13 +1108,14 @@ public final class Detector {
         fishTop = fTop;
         fishBot = fBot;
         if (!fishVisible || fishFromOutline) return true; // do not remember geometry from a fish-less reading
+        if (!lenOk && tBot - tTop != knownTrackH) return true; // (a false end, not corrected: do not remember it)
         memValid = true;
         memX0 = cx0;
         memX1 = cx1;
         memTop = tTop;
         memBot = tBot;
         // (only from a frame where both ends were really scanned, not remembered or inferred)
-        if (sTop == tTop && sBot == tBot && fBot < tBot - 3 && fTop > tTop + 3) knownTrackH = tBot - tTop;
+        if (sTop == tTop && sBot == tBot && fBot < tBot - 3 && fTop > tTop + 3) learnTrackH(tBot - tTop, h);
         // keep the HOME bar as the reference for the tint fallback: the "Pindah!" bar one pitch to the left is not it
         int pitchNow = barPitch(cw);
         // Only learn the reference geometry from a real minigame bar: outside the minigame (catch card, Mancing
@@ -1090,6 +1139,37 @@ public final class Detector {
         memTop = tTop;
         memBot = tBot;
         return true;
+    }
+
+    /** Zone green in a dimmed scene (the darker top of the zone's gradient): still clearly greener than red/blue. */
+    static boolean isZoneDim(int r, int g, int b) {
+        return g >= 95 && g - r >= 35 && g - b >= 10 && b >= 55 && r >= 35;
+    }
+
+    /**
+     * Grows a zone end from row {@code from} towards {@code limit} (dir -1 up, +1 down) over dim-zone rows, also
+     * across the fish lying on the zone (up to maxFish rows) when zone rows follow it; one odd row is tolerated
+     * (the zone's 1 px highlight line), two stop it. Returns the new end.
+     */
+    private int growZone(int[] px, int w, int x0, int x1, int from, int limit, int dir, int need, int maxFish) {
+        int best = from, gap = 0, fishRun = 0;
+        for (int y = from + dir; dir < 0 ? y >= limit : y <= limit; y += dir) {
+            int zc = 0, fc = 0;
+            for (int x = x0; x <= x1; x++) {
+                int c = px[y * w + x];
+                int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+                if (isZone(r, g, b) || isZoneDim(r, g, b)) zc++;
+                else if ((isDark(r, g, b) && !masked(x, y)) || isGhost(r, g, b)) fc++;
+            }
+            if (zc >= need) {
+                best = y;
+                gap = 0;
+                fishRun = 0;
+            } else if (fc >= need && ++fishRun <= maxFish) {
+                gap = 0;
+            } else if (++gap >= 2) break;
+        }
+        return best;
     }
 
     /** Fraction of track rows with an outline pixel just left AND just right of the zone columns. */
@@ -1469,6 +1549,200 @@ public final class Detector {
         zsTop = bestTop;
         zsBot = bestBot;
         return null;
+    }
+
+    // ------------------------------------------------------------------ "Ikan gede nyangkut!" tap targets
+    /**
+     * Epic and above, after Strike: the HUD hides, a banner says "Ikan gede nyangkut! Tap ikannya buat mulai narik"
+     * and a salmon disc (the Strike colour) with the fish icon and a thin cream ring appears at a random place
+     * (seen at the centre, top, left...; ~0.146h across, it bobs ~1.5 px). It stays until tapped (10 s seen), the
+     * fish escapes after ~15 s. All discs found are reported (a later update may show several): tapX/tapY in px.
+     * Call only when needed (it scans the whole frame).
+     */
+    public static final int MAX_TAPS = 8;
+    public int tapN;
+    public final float[] tapX = new float[MAX_TAPS], tapY = new float[MAX_TAPS], tapD = new float[MAX_TAPS];
+    private int lastRingHits;
+    private int[] tapCell = new int[0], tapComp = new int[0], tapQueue = new int[0];
+
+    static boolean isSalmon(int r, int g, int b) {
+        return r >= 200 && g >= 100 && g <= 168 && b >= 75 && b <= 145 && r - g >= 68 && g >= b - 8;
+    }
+
+    private static boolean isRingCream(int r, int g, int b) {
+        return r >= 215 && g >= 195 && b >= 150 && r - b <= 95 && Math.max(r, Math.max(g, b)) - Math.min(r, Math.min(g, b)) <= 95;
+    }
+
+    public void findTapTargets(int[] px, int w, int h) {
+        tapN = 0;
+        int cs = Math.max(3, Math.round(h / 72f)); // 4 px cells at 288 px height
+        int gw = w / cs, gh = h / cs, n = gw * gh;
+        if (tapCell.length != n) {
+            tapCell = new int[n];
+            tapComp = new int[n];
+            tapQueue = new int[n];
+        }
+        java.util.Arrays.fill(tapCell, 0);
+        java.util.Arrays.fill(tapComp, 0);
+        for (int y = 0; y < gh * cs; y += 2) {
+            int row = y * w, cy = (y / cs) * gw;
+            for (int x = 0; x < gw * cs; x += 2) {
+                int c = px[row + x];
+                if (isSalmon((c >> 16) & 255, (c >> 8) & 255, c & 255) && !masked(x, y)) tapCell[cy + x / cs]++;
+            }
+        }
+        int per = ((cs + 1) / 2) * ((cs + 1) / 2), need = Math.max(1, (int) (per * 0.35f));
+        float dMin = 0.10f * h, dMax = 0.19f * h;
+        int comp = 0;
+        for (int s = 0; s < n && tapN < MAX_TAPS; s++) {
+            if (tapCell[s] < need || tapComp[s] != 0) continue;
+            comp++;
+            int qh = 0, qt = 0, cells = 0, gx0 = gw, gx1 = -1, gy0 = gh, gy1 = -1;
+            tapQueue[qt++] = s;
+            tapComp[s] = comp;
+            while (qh < qt) {
+                int k = tapQueue[qh++], kx = k % gw, ky = k / gw;
+                cells++;
+                gx0 = Math.min(gx0, kx);
+                gx1 = Math.max(gx1, kx);
+                gy0 = Math.min(gy0, ky);
+                gy1 = Math.max(gy1, ky);
+                for (int d = 0; d < 4; d++) {
+                    int nx = kx + (d == 0 ? 1 : d == 1 ? -1 : 0), ny = ky + (d == 2 ? 1 : d == 3 ? -1 : 0);
+                    if (nx < 0 || ny < 0 || nx >= gw || ny >= gh) continue;
+                    int q = ny * gw + nx;
+                    if (tapComp[q] == 0 && tapCell[q] >= need) {
+                        tapComp[q] = comp;
+                        tapQueue[qt++] = q;
+                    }
+                }
+            }
+            float bw = (gx1 - gx0 + 1) * cs, bh = (gy1 - gy0 + 1) * cs, d = Math.max(bw, bh);
+            if (d < dMin || d > dMax || bw < 0.6f * bh || bh < 0.6f * bw) continue;
+            // (the fish icon covers the middle, a figure or label can cover one side: a loose fill bound)
+            float disc = (float) (Math.PI / 4 * d * d) / (cs * cs);
+            if (cells < 0.30f * disc || cells > 1.25f * disc) continue;
+            float cx = (gx0 + gx1 + 1) * cs / 2f, cy = (gy0 + gy1 + 1) * cs / 2f;
+            float R = tapRing(px, w, h, cx, cy, d / 2f);
+            if (DEBUG) System.out.printf("  [tap? %.0f,%.0f d=%.0f cells=%d/%.0f ring=%.1f hits=%d]%n", cx, cy, d, cells, disc, R, lastRingHits);
+            if (R < 0) continue;
+            // tap the centre, or a visible part of the disc when our own panel covers the centre (a tap there would
+            // hit the panel - its ▶/■ button - instead of the game)
+            float tx = tapFitX, ty = tapFitY;
+            for (int k = 0; k < 9 && masked(Math.round(tx), Math.round(ty)); k++) {
+                double a = 2 * Math.PI * k / 8;
+                tx = (float) (tapFitX + Math.cos(a) * 0.6f * R);
+                ty = (float) (tapFitY + Math.sin(a) * 0.6f * R);
+            }
+            if (masked(Math.round(tx), Math.round(ty))) continue;
+            tapX[tapN] = tx;
+            tapY[tapN] = ty;
+            tapD[tapN] = 2 * R;
+            tapN++;
+        }
+    }
+
+    /**
+     * The disc's cream ring: along 12 rays from the centre outwards, the first cream pixel right after a run of
+     * salmon (the fish icon inside has white too, but it is followed by more salmon, not by the ring's end).
+     * The centre is then re-fitted to the ring points (a circle fit: the box centre is off when something covers
+     * one side) and the rays are cast again from there. Returns the ring radius (tapFitX/Y = centre), or -1.
+     */
+    private float tapFitX, tapFitY;
+
+    private float tapRing(int[] px, int w, int h, float cx, float cy, float r0) {
+        final int RAYS = 12;
+        float[] rad = new float[RAYS], hx = new float[RAYS], hy = new float[RAYS];
+        float med = -1;
+        for (int pass = 0; pass < 2; pass++) {
+            int hits = 0, hidden = 0;
+            for (int k = 0; k < RAYS; k++) {
+                double a = 2 * Math.PI * k / RAYS;
+                double ux = Math.cos(a), uy = Math.sin(a);
+                int run = 0;
+                for (float d = 0.45f * r0; d <= 1.45f * r0; d += 1f) {
+                    int x = (int) Math.round(cx + ux * d), y = (int) Math.round(cy + uy * d);
+                    if (x < 0 || y < 0 || x >= w || y >= h || masked(x, y)) {
+                        hidden++;
+                        break;
+                    }
+                    int c = px[y * w + x];
+                    int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+                    if (run >= 2 && isRingCream(r, g, b)) {
+                        rad[hits] = d;
+                        hx[hits] = x;
+                        hy[hits] = y;
+                        hits++;
+                        break;
+                    }
+                    run = isSalmon(r, g, b) ? run + 1 : (run > 0 && d > 0.7f * r0 ? run : 0);
+                }
+            }
+            lastRingHits = hits;
+            // (half of the ring is enough: our own panel or a player's figure can cover one side of the disc; with
+            // 3+ rays ending under our panel 5 matching rays do. A first guess off-centre still gets its circle fit.)
+            int need = hidden >= 3 ? 5 : 6;
+            if (hits < (pass == 0 ? 4 : need)) return -1;
+            float[] sr = java.util.Arrays.copyOf(rad, hits);
+            java.util.Arrays.sort(sr);
+            med = sr[hits / 2];
+            if (DEBUG) System.out.println("    ring pass" + pass + " c=" + cx + "," + cy + " radii " + java.util.Arrays.toString(sr));
+            int ok = 0;
+            for (int k = 0; k < hits; k++) if (Math.abs(rad[k] - med) <= Math.max(2.5f, 0.15f * med)) ok++;
+            if (ok >= need && hits >= need && med >= 0.7f * r0 && med <= 1.35f * r0 && med >= 0.0625f * h && med <= 0.0875f * h) {
+                // the ring is thin: a few px further out it is the game world, not more cream (an orange fish
+                // picture on the cream catch card has the same colours but cream all around it)
+                int out = 0, outCream = 0;
+                for (int k = 0; k < RAYS; k++) {
+                    double a = 2 * Math.PI * k / RAYS;
+                    float d = med + Math.max(4f, 0.18f * med);
+                    int x = (int) Math.round(cx + Math.cos(a) * d), y = (int) Math.round(cy + Math.sin(a) * d);
+                    if (x < 0 || y < 0 || x >= w || y >= h || masked(x, y)) continue;
+                    int c = px[y * w + x];
+                    out++;
+                    if (isRingCream((c >> 16) & 255, (c >> 8) & 255, c & 255)) outCream++;
+                }
+                if (DEBUG) System.out.println("    outside cream " + outCream + "/" + out);
+                if (out > 0 && outCream > 0.5f * out) return -1;
+                tapFitX = cx;
+                tapFitY = cy;
+                return med;
+            }
+            if (pass == 1) break;
+            // circle fit (x^2+y^2 + A x + B y + C = 0, least squares) through all ring points
+            double sxx = 0, sxy = 0, syy = 0, sx1 = 0, sy1 = 0, sxz = 0, syz = 0, sz = 0;
+            for (int k = 0; k < hits; k++) {
+                double x = hx[k] - cx, y = hy[k] - cy, z = x * x + y * y;
+                sxx += x * x;
+                sxy += x * y;
+                syy += y * y;
+                sx1 += x;
+                sy1 += y;
+                sxz += x * z;
+                syz += y * z;
+                sz += z;
+            }
+            double[][] m = {{sxx, sxy, sx1, -sxz}, {sxy, syy, sy1, -syz}, {sx1, sy1, hits, -sz}};
+            for (int i = 0; i < 3; i++) { // Gauss-Jordan with partial pivoting
+                int pv = i;
+                for (int j = i + 1; j < 3; j++) if (Math.abs(m[j][i]) > Math.abs(m[pv][i])) pv = j;
+                double[] t = m[i];
+                m[i] = m[pv];
+                m[pv] = t;
+                if (Math.abs(m[i][i]) < 1e-9) return -1;
+                for (int j = 0; j < 3; j++) {
+                    if (j == i) continue;
+                    double f = m[j][i] / m[i][i];
+                    for (int q = i; q < 4; q++) m[j][q] -= f * m[i][q];
+                }
+            }
+            double A = m[0][3] / m[0][0], B = m[1][3] / m[1][1];
+            float nx = (float) (cx - A / 2), ny = (float) (cy - B / 2);
+            if (Math.abs(nx - cx) > 0.5f * r0 || Math.abs(ny - cy) > 0.5f * r0) return -1;
+            cx = nx;
+            cy = ny;
+        }
+        return -1;
     }
 
     public String describe() {

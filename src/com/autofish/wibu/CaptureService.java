@@ -202,7 +202,7 @@ public class CaptureService extends Service {
     // ---- on-phone history (private build): photos of the moments that matter ----
     private boolean wasInGame;
     private int lastBtn = -1;
-    private int lastMisses, outShots;
+    private int lastMisses, outShots, lastFishTaps;
     private long blindSince = -1, resultAt = -1, lastPrevCopy;
     private boolean blindShot, prevValid, stuckShot;
     private int[] prevPx;
@@ -259,11 +259,16 @@ public class CaptureService extends Service {
             resultAt = -1;
             gameStartT = now;
         }
-        if (rec && (inGame || bot.det.button != Detector.BTN_NONE || resultAt > 0)
-                && now - lastRecPhoto >= (inGame ? 200 : 1000)) {
+        // (between Strike and the minigame the HUD hides for the "tap the fish" disc: no button, but record it)
+        boolean waitTap = bot.awaitingFishTap(now);
+        if (rec && (inGame || bot.det.button != Detector.BTN_NONE || resultAt > 0 || waitTap)
+                && now - lastRecPhoto >= (inGame || waitTap ? 200 : 1000)) {
             lastRecPhoto = now;
-            Riwayat.photo(pixels, w, h, inGame ? g : "x");
+            Riwayat.photo(pixels, w, h, inGame ? g : waitTap ? "tap" : "x");
         }
+        // normal mode: one photo of each fish disc the bot taps (it shows the disc just before the tap lands)
+        if (bot.fishTaps > lastFishTaps && !rec) Riwayat.photo(pixels, w, h, "g" + (bot.minigames + 1) + "-tapikan");
+        lastFishTaps = bot.fishTaps;
         if (inGame) {
             if (bot.perfectMisses > lastMisses && outShots < 1 && !rec) {
                 outShots++;
@@ -285,7 +290,8 @@ public class CaptureService extends Service {
                 lastPrevCopy = now;
             }
         } else if (wasInGame && (bot.perfectMisses > 0 || now - gameStartT > 15000 || rec))
-            resultAt = now + 1200; // the catch card or "Lolos" is on screen by then
+            resultAt = now + 2700; // the catch card has finished popping up (its XP strip shows "★" only for a perfect
+            // catch); at +1.2 s it was still animating and unreadable. The bot closes the card at +3.5 s.
         if (!inGame && resultAt > 0 && now >= resultAt) {
             resultAt = -1;
             Riwayat.photo(pixels, w, h, g + "-hasil");
@@ -358,7 +364,8 @@ public class CaptureService extends Service {
     public String statusLine() {
         Bot b = bot;
         if (b == null) return "";
-        return b.status + String.format(Locale.US, "\nLempar %d · Strike %d · Tarik %d", b.casts, b.strikes, b.minigames);
+        return b.status + String.format(Locale.US, "\nLempar %d · Strike %d · Tarik %d", b.casts, b.strikes, b.minigames)
+                + (b.fishTaps > 0 ? " · Tap ikan " + b.fishTaps : "");
     }
 
     public String debugLine() {

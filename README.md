@@ -5,7 +5,7 @@
 Aplikasi Android sederhana yang otomatis mancing di game Wibu Fish:
 membaca layar lewat rekam layar, lalu menekan tombol lewat layanan aksesibilitas. **Tidak perlu root dan tidak perlu PC** setelah terinstal.
 
-## Dua versi APK (versi 1.9, ≈57 KB)
+## Dua versi APK (versi 2.1, ≈58 KB)
 
 | File | Untuk siapa | Bedanya |
 |---|---|---|
@@ -25,6 +25,42 @@ Kode HP berubah kalau HP di-reset pabrik.
 Batasan: kode sumbernya tetap ada di git, jadi orang yang paham pemrograman bisa membuang kuncinya dan build sendiri. Kalau mau benar-benar tertutup, jadikan repo GitHub-nya private.
 
 ## Riwayat versi
+
+- **2.1** (2026-11-21, setelah tes langsung 2.0): tombol ikan tersentuh 9 dari 9 kali di game (minigame mulai ±0,2 detik sesudahnya).
+  - Kalau tepi atas lingkaran tertutup panel bot, deteksinya dulu hanya kadang berhasil (sekali telat 1,6 detik). Sekarang pusatnya dihitung ulang
+    dari titik-titik cincin yang terlihat, jadi terdeteksi di semua frame. Diuji ulang: semua tombol di video kena, 4.185 foto lain tanpa salah sentuh.
+  - Bar "beku" (event: garis luar abu-abu kebiruan, layar lebih gelap) terbaca bergantian normal/REL; bacaan zona 10–30 px (zona aslinya 55 px)
+    membuat bot mengira zonanya tinggal setengah. Bacaan yang jauh lebih kecil dari tinggi zona sekarang diabaikan kecuali bertahan ±0,5 detik.
+  - Catatan: zona yang meloncat sendiri ke ujung (atas/bawah) dalam satu frame tetap terjadi (3 dari 4 bintang yang hilang di tes ini).
+    Tidak ada hubungannya dengan cara bot menekan; belum ketemu tanda sebelum loncatan.
+
+- **2.1** (2026-11-21, dari riwayat POCO 12:12–12:25, 33 minigame, sebagian dengan REC):
+  - **Event "Aurora"** menggelapkan seluruh layar. Bagian atas zona hijau (warnanya bergradasi) jadi terlalu gelap untuk filter warna zona,
+    jadi hanya bagian bawahnya yang terbaca: tinggi zona turun dari ±53 px ke median 40 (kadang 11), bot terus menahan Tarik dan zona naik
+    melewati ikan. Sebelum Aurora 8/8 minigame "sempurna", sesudahnya hampir semua tercatat "keluar zona" dan beberapa Rare/Uncommon kehilangan bintang
+    (bintang mati ±0,6–1 detik setelah mulai). Sekarang, di dalam trek, zona diperluas ke baris yang "hijau zona redup" (juga melewati ikan yang menutupinya).
+    Uji: frame normal digelapkan 28% → zona lama rata-rata 45,8 px, baru 55,1 px (aslinya ±55).
+  - **Panjang trek yang diingat** dulu diambil dari satu frame saja; satu bacaan salah saat lawan Legendary membuatnya 130 (aslinya 144). Di Aurora
+    garis tepi atas trek terlalu gelap untuk dipindai, jadi ujung atas ditebak dari angka itu dan meleset 13 px (trek dikira mulai di y=103, bukan 89).
+    Sekarang dipilih panjang yang paling sering terbaca.
+  - **Tepi trek palsu yang merayap**: di fase Legendary "Ke darat!" tanah di bawah trek terbaca sebagai tepi bawah, bergeser beberapa px per frame
+    (masih di dalam toleransi memori) dari 224 ke 195 dan menempel ±20 detik. Kalau panjang trek tidak cocok dengan panjang yang dikenal, ujung yang
+    salah sekarang dihitung ulang dari ujung yang cocok dengan memori, dan bacaan itu tidak disimpan. (Juga memperbaiki trek 89–173 di sesi pagi.)
+  - Riwayat: foto `-hasil` diambil 2,7 detik setelah minigame (dulu 1,2 detik, kartunya masih beranimasi jadi "★ XP" tidak terbaca).
+  - Masih terbuka: Pindah + ikan Hantu (zona REL terbaca ±15 px terlalu panjang di bawah), fase "Ke darat!" (Tarik = lompat) belum ditangani khusus.
+- **2.0** (2026-11-21, dari riwayat + rekaman layar POCO):
+  - **"Ikan gede nyangkut! Tap ikannya buat mulai narik"** (Epic ke atas, setelah Strike): HUD hilang dan muncul lingkaran oranye-salmon
+    berisi gambar ikan dengan cincin krem tipis di tempat acak (terlihat di tengah, atas, kiri; ±0,15 tinggi layar). Bot dulu diam saja
+    ("Menunggu...") dan ikannya lepas setelah ±15 detik. Sekarang bot mencari **semua** lingkaran seperti itu di seluruh layar (kalau nanti
+    jadi 5, kelimanya disentuh satu per satu), menyentuhnya 0,15 detik setelah stabil, dan menyentuh lagi kalau masih ada (tiap 0,8 detik,
+    setelah 5 kali tiap 2 detik). Kalau panel bot menutupi tengah lingkaran, bot menyentuh bagian yang kelihatan (tidak pernah menyentuh panel).
+    Hanya dicari antara Strike dan minigame, jadi gambar ikan oranye di kartu hasil tidak ikut tersentuh. Diuji pada 6 kemunculan di 4 video
+    (semua kena) dan 2.900 frame/foto lain (tidak ada salah sentuh). Panel menampilkan `Tap ikan (n tombol)` dan log `Ikan gede nyangkut: tap tombol ikan…`.
+  - Riwayat: REC sekarang juga memotret saat menunggu tombol ikan (5x/detik, nama `tap`), mode biasa menyimpan satu foto `-tapikan` tiap tombol yang disentuh.
+  - Zona kadang **pindah sendiri ±25–38 px dalam satu frame** (Common/Uncommon juga, bintang hilang). Itu dari game, bot bereaksi dalam 1 frame;
+    lompatan itu sekarang tidak lagi dihitung sebagai kecepatan zona (dulu bot mengira zona melaju 400–600 px/s dan salah mengerem sesudahnya).
+  - **Pindah (Epic)**: 8 dari 9 bintang Epic yang hilang kemarin adalah Pindah dengan cincin di ujung trek yang jauh dari ikan. Mulai 0,6 detik setelah
+    cincin muncul, kalau ikan dan titik mendarat tidak muat sekaligus di zona, zona digeser lebih jauh ke titik mendarat (tengah ikan tetap di dalam zona).
 
 - **1.9**: mekanik legend baru dari rekaman REC (Hiu Kristal, Legendary, 30 + 47 detik) dan perbaikan kecil "Rare tidak sempurna".
   - **"Rintangan! Lewati celah tembok ikan"**: layar berubah jadi langit, tembok ikan bergeser dari kiri ke bar. Saat tembok sampai di bar,

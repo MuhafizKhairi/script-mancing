@@ -73,6 +73,18 @@ public final class Bot {
     /** Mancing taps since the last "Angkat" (waiting for a bite): 3+ means casting is stuck. */
     public int mancingTaps;
 
+    // ---- "Ikan gede nyangkut! Tap ikannya buat mulai narik" (epic+): tap every fish disc (Detector.findTapTargets) ----
+    /** A Strike was seen and no minigame has started since: that is when the discs come (-1 = not waiting). */
+    private long strikeSeenMs = -1;
+    private static final int MAX_TG = Detector.MAX_TAPS;
+    private final float[] tgX = new float[MAX_TG], tgY = new float[MAX_TG];
+    private final long[] tgFirst = new long[MAX_TG], tgLast = new long[MAX_TG], tgTapMs = new long[MAX_TG];
+    private final int[] tgTaps = new int[MAX_TG];
+    private int tgN;
+    private long lastTgTapMs = -100000;
+    /** Fish discs tapped so far (first taps only), for the status line / history. */
+    public int fishTaps;
+
     // ---- minigame state ----
     private boolean inGame;
     private long gameStartMs, lastBarMs = -1;
@@ -108,7 +120,7 @@ public final class Bot {
     private boolean lastInZone = true;
     private float zoneH = 0;
     private final float[] hHist = new float[31];
-    private int hN;
+    private int hN, smallRun;
     private float aUp, aDown; // px/s^2, magnitudes while holding / releasing
     private boolean inverted;
     private int invEvidence;
@@ -269,6 +281,7 @@ public final class Bot {
                 }
                 break;
             case Detector.BTN_STRIKE:
+                strikeSeenMs = now;
                 status = "Strike!";
                 if (now - lastTapMs > 250 || lastTapBtn != Detector.BTN_STRIKE) {
                     if (lastTapBtn != Detector.BTN_STRIKE) strikes++;
@@ -276,6 +289,8 @@ public final class Bot {
                 }
                 break;
             default:
+                // after Strike an epic+ fish asks to tap it ("Ikan gede nyangkut!"): the HUD hides, a disc appears
+                if (strikeSeenMs > 0 && now - strikeSeenMs < 30000 && tapFishDiscs(px, w, h, now)) break;
                 status = "Menunggu...";
                 // the catch card ("Ketuk untuk menutup") may hide the button: tap the card to close it
                 if (lastGameEndMs > 0 && now - lastGameEndMs > 3500 && dismissTaps < 2 && now - lastTapMs > 2500) {
@@ -295,10 +310,74 @@ public final class Bot {
         lastTapBtn = btn;
     }
 
+    /** True while this waits for a fish disc (between Strike and the minigame). */
+    public boolean awaitingFishTap(long now) {
+        return strikeSeenMs > 0 && now - strikeSeenMs < 30000 && !inGame;
+    }
+
+    /**
+     * Finds the "tap the fish" discs, follows each one over the frames (they bob a little), and taps every disc
+     * once it has been steady for 150 ms (one tap per frame, 150 ms apart; a disc still there 0.8 s after its tap
+     * is tapped again, after 5 tries every 2 s). Works for any number of discs. Returns true while discs are on screen.
+     */
+    private boolean tapFishDiscs(int[] px, int w, int h, long now) {
+        det.findTapTargets(px, w, h);
+        float tol = 0.06f * h;
+        for (int i = 0; i < det.tapN; i++) {
+            int j = 0;
+            while (j < tgN && (Math.abs(det.tapX[i] - tgX[j]) > tol || Math.abs(det.tapY[i] - tgY[j]) > tol)) j++;
+            if (j == tgN) {
+                if (tgN == MAX_TG) continue;
+                tgN++;
+                tgFirst[j] = now;
+                tgTaps[j] = 0;
+                tgTapMs[j] = 0;
+            }
+            tgX[j] = det.tapX[i];
+            tgY[j] = det.tapY[i];
+            tgLast[j] = now;
+        }
+        for (int j = 0; j < tgN; ) { // forget discs gone for 0.6 s
+            if (now - tgLast[j] > 600) {
+                tgN--;
+                tgX[j] = tgX[tgN];
+                tgY[j] = tgY[tgN];
+                tgFirst[j] = tgFirst[tgN];
+                tgLast[j] = tgLast[tgN];
+                tgTapMs[j] = tgTapMs[tgN];
+                tgTaps[j] = tgTaps[tgN];
+            } else j++;
+        }
+        int onScreen = 0;
+        for (int j = 0; j < tgN; j++) if (tgLast[j] == now) onScreen++;
+        if (onScreen == 0) return false;
+        if (now - lastTgTapMs >= 150) {
+            for (int j = 0; j < tgN; j++) {
+                if (tgLast[j] != now || now - tgFirst[j] < 150) continue;
+                if (tgTaps[j] > 0 && now - tgTapMs[j] < (tgTaps[j] < 5 ? 800 : 2000)) continue;
+                act.tap(tgX[j] / w, tgY[j] / h);
+                if (tgTaps[j] == 0) fishTaps++;
+                act.log(String.format(java.util.Locale.US, "Ikan gede nyangkut: tap tombol ikan%s di %.0f%%,%.0f%% (%d di layar)",
+                        tgTaps[j] > 0 ? " lagi" : "", 100 * tgX[j] / w, 100 * tgY[j] / h, onScreen));
+                tgTaps[j]++;
+                tgTapMs[j] = now;
+                lastTgTapMs = now;
+                lastTapMs = now;
+                lastTapBtn = -2;
+                break;
+            }
+        }
+        status = "Tap ikan (" + onScreen + " tombol)";
+        lastKnownMs = now; // a fish disc is a known screen too (no idle stop while it waits)
+        return true;
+    }
+
     // ------------------------------------------------------------------ minigame
     private void startGame(long now) {
         inGame = true;
         minigames++;
+        strikeSeenMs = -1;
+        tgN = 0;
         gameStartMs = now;
         lastBarMs = now;
         prevMs = -1;
@@ -312,6 +391,7 @@ public final class Bot {
         perfectMisses = 0;
         lastInZone = true;
         hN = 0;
+        smallRun = 0;
         zoneH = 0;
         aUp = aDown = -1;
         inverted = false;
@@ -385,7 +465,12 @@ public final class Bot {
         // --- robust zone centre (the fish icon can hide one end of the zone) ---
         float hMeas = d.zoneBot - d.zoneTop;
         // (in the "Rintangan!" scene the glow and the gap line often stretch the reading: keep the known height)
-        if (!(rintangan && hN > 8 && hMeas > 1.2f * zoneH)) {
+        // A reading far below the known height is the fish (or a tinted/frozen bar read half in REL, half normally:
+        // 10-30 px readings of a 55 px zone, 2026-11-21) covering part of the zone; it dragged the median down to
+        // half size. Only take such readings once they persist (~0.5 s: the zone really changed size).
+        boolean small = hN > 8 && hMeas < 0.6f * zoneH;
+        smallRun = small ? smallRun + 1 : 0;
+        if (!(rintangan && hN > 8 && hMeas > 1.2f * zoneH) && (!small || smallRun > 25)) {
             hHist[hN % hHist.length] = hMeas;
             hN++;
         }
@@ -404,7 +489,12 @@ public final class Bot {
         boolean fishSeen = d.fishVisible && !Float.isNaN(d.fishY);
         if (!Float.isNaN(zc) && dt > 0.001f && dt < 0.25f) {
             float k = (float) (1 - Math.exp(-dt / 0.05));
-            vz += k * ((center - zc) / dt - vz);
+            // The game sometimes moves the zone by ~half its height in ONE frame (seen with Common/Uncommon fish,
+            // 2026-11-21: 25-38 px, both ends together, the fish still): a jump, not a speed. Taking it as speed
+            // gave vz = 400-600 px/s and wrong braking right after; keep the speed we had.
+            float jump = Math.abs(center - zc);
+            if (!(jump > Math.max(0.3f * zoneH, 2.5f * Math.abs(vz) * dt + 6f)))
+                vz += k * ((center - zc) / dt - vz);
             if (fishSeen && fishKnown) {
                 if (Math.abs(d.fishY - fy) > 0.22f * trackH) {
                     vf = 0; // the fish jumped (into the other "Pindah!" bar / a dash landed): not a speed
@@ -585,15 +675,24 @@ public final class Bot {
         float fh = fishHalf > 0 ? fishHalf : 0.07f * trackH;
         // how far the zone centre may be from the fish centre with the WHOLE fish still inside (star rule)
         float slack = Math.max(2f, zoneH / 2f - fh);
+        float guard = activeWarn == 0 ? guardOf(slack) : Float.MAX_VALUE;
         if (cfg.anticipate && !Float.isNaN(markerFrac)) {
             // lean toward the height it will land at, but never so far that part of the fish leaves the zone
             float target = d.trackTop + markerFrac * trackH;
             float maxP = Math.max(0, guardOf(slack) - 2f);
+            // The jump comes 0.8-1.3 s after the ring. When the landing height is too far to keep both the fish and
+            // it inside the zone (8 of 9 lost Epic stars on 2026-11-20 were "Pindah" with the ring at the other end
+            // of the track), from 0.6 s on lean further: the fish's centre stays inside (a body edge poking out
+            // briefly kept the star in the logs), so the zone already covers more of the landing height.
+            if (Math.abs(target - fy) > maxP && now - markerFirstMs > 600) {
+                maxP = Math.max(maxP, zoneH / 2f - 0.35f * fh - 2f);
+                guard = Math.max(guard, maxP + 1f);
+            }
             lead = Math.max(-maxP, Math.min(maxP, target - fy));
         }
         // the dash lead deliberately sits near the edge (legendary only, the game tolerates it): no guard then
         lastLead = lead;
-        boolean hold = decide(fy, vf, lead, activeWarn == 0 ? guardOf(slack) : Float.MAX_VALUE);
+        boolean hold = decide(fy, vf, lead, guard);
         setHold(hold, now);
 
         float zTop = zc - zoneH / 2f, zBot = zc + zoneH / 2f;

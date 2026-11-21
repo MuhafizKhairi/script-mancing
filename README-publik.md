@@ -6,7 +6,7 @@
 Auto Mancing memancing otomatis di Wibu Fish: membaca layar lewat rekam layar, lalu menekan tombol lewat layanan aksesibilitas.
 Tidak perlu root dan tidak perlu PC.
 
-File: `AutoMancing-publik.apk` (versi 1.9)
+File: `AutoMancing-publik.apk` (versi 2.1)
 
 ## Cara pasang
 
