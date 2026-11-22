@@ -36,7 +36,7 @@ if [ "$VARIANT" = dev ]; then # launcher name "Auto Mancing Dev"
     OVERLAY=(-R "$OUT/res-dev.zip")
 fi
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$JAR" --manifest AndroidManifest.xml --java "$OUT/gen" \
-    --min-sdk-version 26 --target-sdk-version 34 --version-code 12 --version-name 2.1 "$OUT/res.zip" ${OVERLAY[@]+"${OVERLAY[@]}"}
+    --min-sdk-version 26 --target-sdk-version 34 --version-code 13 --version-name 2.2 "$OUT/res.zip" ${OVERLAY[@]+"${OVERLAY[@]}"}
 
 echo "[2/6] javac"
 javac -nowarn -Xlint:-options -source 8 -target 8 -encoding UTF-8 -bootclasspath "$JAR:$BT/core-lambda-stubs.jar" -d "$OUT/classes" \

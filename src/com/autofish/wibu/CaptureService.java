@@ -292,7 +292,8 @@ public class CaptureService extends Service {
         } else if (wasInGame && (bot.perfectMisses > 0 || now - gameStartT > 15000 || rec))
             resultAt = now + 2700; // the catch card has finished popping up (its XP strip shows "★" only for a perfect
             // catch); at +1.2 s it was still animating and unreadable. The bot closes the card at +3.5 s.
-        if (!inGame && resultAt > 0 && now >= resultAt) {
+        // the bot now closes the card as soon as it shows: take the photo on that frame
+        if (!inGame && resultAt > 0 && (now >= resultAt || bot.cardPhotoDue)) {
             resultAt = -1;
             Riwayat.photo(pixels, w, h, g + "-hasil");
             Riwayat.trim();

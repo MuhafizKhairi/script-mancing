@@ -26,8 +26,17 @@ public final class Bot {
     }
 
     public static final class Config {
-        /** Seconds to wait after "Lepas!" appears before tapping it (lets the power meter fill). */
-        public float castDelay = 0.45f;
+        /**
+         * Seconds to wait after "Lepas!" appears before tapping it, used only when the power gauge is not readable
+         * (the gauge fills in ~1.4 s; the red part ends ~0.55 s, yellow from ~0.8 s).
+         */
+        public float castDelay = 1.1f;
+        /**
+         * Cast power: hold Mancing until the "Lepas!" gauge is this full (0..1). 0 = just tap Mancing, which casts
+         * at once with almost no power (Hae's choice 2026-11-22: waiting for the gauge every cast is too slow, and a
+         * weak cast did not make the bites come noticeably later).
+         */
+        public float castFill = 0f;
         /** Expected total latency screen->touch, seconds (used to predict ahead). */
         public float latency = 0.10f;
         /** Initial guess of the zone acceleration, in track-heights per second^2. */
@@ -70,6 +79,18 @@ public final class Bot {
     private long lastGameEndMs = -1;
     private boolean sawCastProgress;
     private long lastLepasSeenMs = -100000;
+    /** Highest "Lepas!" gauge fill seen in this cast (-1 = gauge never seen). */
+    private float gaugeMax = -1;
+    /**
+     * Since 2026-11-21 casting is press-and-hold: holding Mancing turns it into "Lepas!" and fills the power gauge,
+     * lifting the finger casts. When the hold started (-1 = not holding for a cast).
+     */
+    private long castHoldMs = -1;
+    // catch card: closed as soon as it is seen (it used to be tapped blindly 3.5 s after the minigame)
+    private long cardWindowMs = -1, cardSinceMs = -1;
+    private int cardTaps;
+    /** Set on the frame where the bot first taps the catch card (CaptureService takes the result photo then). */
+    public boolean cardPhotoDue;
     /** Mancing taps since the last "Angkat" (waiting for a bite): 3+ means casting is stuck. */
     public int mancingTaps;
 
@@ -156,6 +177,7 @@ public final class Bot {
 
     public void stop(String why) {
         if (holding) setHold(false, 0);
+        castHoldMs = -1;
         stopped = true;
         stopReason = why;
         status = "Berhenti: " + why;
@@ -218,7 +240,31 @@ public final class Bot {
             }
             endGame(now);
         }
-        if (holding) setHold(false, now);
+        if (holding && castHoldMs < 0) setHold(false, now);
+
+        // catch card ("Ketuk untuk menutup"): the game ignores taps for its first ~1.7 s (pop-up animation), so tap
+        // from 0.25 s on every 0.25 s; the first tap that counts closes it
+        cardPhotoDue = false;
+        if (det.cardVisible && cardWindowMs > 0 && now - cardWindowMs < 20000 && castHoldMs < 0) {
+            if (cardSinceMs < 0) cardSinceMs = now;
+            status = "Tutup kartu hasil";
+            lastKnownMs = now;
+            if (now - cardSinceMs >= 250 && now - lastTapMs >= 240 && cardTaps < 16) {
+                if (cardTaps == 0) {
+                    cardPhotoDue = true;
+                    act.log("Tutup kartu hasil");
+                }
+                act.tap(0.5f, 0.42f);
+                lastTapMs = now;
+                lastTapBtn = -1;
+                cardTaps++;
+            }
+            return;
+        }
+        cardSinceMs = -1;
+        if (cardTaps > 0) lastGameEndMs = -1; // closed: no blind tap later
+
+        if (castHoldMs >= 0 && castHold(btn, now)) return;
 
         if (btn != Detector.BTN_NONE) {
             lastKnownMs = now;
@@ -229,7 +275,10 @@ public final class Bot {
             stop("tidak ada tombol pancing terdeteksi selama " + (int) cfg.idleStop + " detik");
             return;
         }
-        if (btn != Detector.BTN_LEPAS) lepasSinceMs = -1;
+        if (btn != Detector.BTN_LEPAS) {
+            lepasSinceMs = -1;
+            gaugeMax = -1;
+        }
         if (btn != Detector.BTN_ANGKAT) angkatSinceMs = -1;
 
         switch (btn) {
@@ -245,14 +294,27 @@ public final class Bot {
                     stop("sudah " + casts + " kali lempar");
                     return;
                 }
-                if (now - lastTapMs > 1500) {
+                // (right after closing the card there is no need to wait long: the button is live at once)
+                if (now - lastTapMs > (lastTapBtn == Detector.BTN_MANCING ? 1500 : 300)) {
                     if (lastTapBtn == Detector.BTN_MANCING && !sawCastProgress) failedStarts++;
                     if (failedStarts >= cfg.maxFailedStarts) {
                         stop("tombol Mancing tidak merespons (umpan habis?)");
                         return;
                     }
                     sawCastProgress = false;
-                    tap(btn, now);
+                    if (cfg.castFill <= 0) { // plain tap: casts right away
+                        tap(btn, now);
+                        lastLepasSeenMs = now; // the "..." disc that follows reads as Mancing: do not tap it again
+                        break;
+                    }
+                    // press and keep holding: the button becomes "Lepas!" with the power gauge (see castHold)
+                    mancingTaps++;
+                    lastTapMs = now;
+                    lastTapBtn = btn;
+                    castHoldMs = now;
+                    lepasSinceMs = -1;
+                    gaugeMax = -1;
+                    setHold(true, now);
                 }
                 break;
             case Detector.BTN_LEPAS:
@@ -261,7 +323,20 @@ public final class Bot {
                 failedStarts = 0;
                 status = "Lempar umpan";
                 if (lepasSinceMs < 0) lepasSinceMs = now;
-                if ((now - lepasSinceMs) / 1000f >= cfg.castDelay && now - lastTapMs > 900) {
+                float since = (now - lepasSinceMs) / 1000f, g = det.gaugeFill;
+                boolean release;
+                if (g >= 0) {
+                    // release in the yellow part; also if the gauge already turned back down, or it takes too long
+                    release = g >= cfg.castFill || (gaugeMax >= 0.5f && g < gaugeMax - 0.08f) || since > 2.5f;
+                    gaugeMax = Math.max(gaugeMax, g);
+                    status = String.format(java.util.Locale.US, "Lempar umpan (tenaga %d%%)", Math.round(g * 100));
+                } else {
+                    // gauge hidden (popup, effect): time it, unless it was seen nearly full a moment ago
+                    release = since >= cfg.castDelay || gaugeMax >= cfg.castFill - 0.1f;
+                }
+                if (release && now - lastTapMs > 900) {
+                    if (g >= 0 || gaugeMax >= 0)
+                        act.log(String.format(java.util.Locale.US, "Lepas! di tenaga %d%% (%.2f s)", Math.round(Math.max(g, gaugeMax) * 100), since));
                     tap(btn, now);
                     casts++;
                 }
@@ -301,6 +376,57 @@ public final class Bot {
                     act.log("Tutup kartu hasil");
                 }
         }
+    }
+
+    /**
+     * While Mancing is held for a cast: wait for "Lepas!", then lift the finger once the power gauge reaches
+     * cfg.castFill (or it turns back down / takes too long; timed with cfg.castDelay when the gauge is hidden).
+     * If "Lepas!" never comes while holding (older tap-tap casting), let go after 1.2 s: a "Lepas!" that then stays
+     * is tapped by the normal Lepas case. Returns true when this frame was handled.
+     */
+    private boolean castHold(int btn, long now) {
+        float held = (now - castHoldMs) / 1000f;
+        if (btn == Detector.BTN_LEPAS) {
+            lastLepasSeenMs = now;
+            sawCastProgress = true;
+            failedStarts = 0;
+            if (lepasSinceMs < 0) lepasSinceMs = now;
+            float since = (now - lepasSinceMs) / 1000f, g = det.gaugeFill;
+            boolean release;
+            if (g >= 0) {
+                release = g >= cfg.castFill || (gaugeMax >= 0.5f && g < gaugeMax - 0.08f) || since > 2.5f;
+                gaugeMax = Math.max(gaugeMax, g);
+                status = String.format(java.util.Locale.US, "Lempar umpan (tenaga %d%%)", Math.round(g * 100));
+            } else {
+                release = since >= cfg.castDelay || gaugeMax >= cfg.castFill - 0.1f || since > 2.5f;
+                status = "Lempar umpan";
+            }
+            if (release) {
+                setHold(false, now);
+                castHoldMs = -1;
+                lastTapMs = now;
+                lastTapBtn = Detector.BTN_LEPAS;
+                casts++;
+                act.log(gaugeMax >= 0
+                        ? String.format(java.util.Locale.US, "Lepas! di tenaga %d%% (%.2f s)", Math.round(Math.max(g, gaugeMax) * 100), since)
+                        : String.format(java.util.Locale.US, "Lepas! tanpa meteran (%.2f s)", since));
+            }
+            lastKnownMs = now;
+            return true;
+        }
+        if ((btn == Detector.BTN_MANCING || btn == Detector.BTN_NONE) && held < 1.2f && lepasSinceMs < 0) {
+            status = "Mulai mancing (tahan)";
+            return true;
+        }
+        // anything else (or Lepas! gone, or it never came): let go and carry on normally
+        setHold(false, now);
+        castHoldMs = -1;
+        if (lepasSinceMs >= 0) {
+            casts++;
+            lastTapMs = now;
+            lastTapBtn = Detector.BTN_LEPAS;
+        }
+        return false;
     }
 
     private void tap(int btn, long now) {
@@ -414,6 +540,8 @@ public final class Bot {
     private void endGame(long now) {
         inGame = false;
         lastGameEndMs = now;
+        cardWindowMs = now;
+        cardTaps = 0;
         setHold(false, now);
         det.resetMemory();
         act.log("Minigame selesai (" + (now - gameStartMs) / 1000f + " s, ikan keluar zona "

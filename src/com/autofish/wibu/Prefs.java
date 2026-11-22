@@ -16,7 +16,9 @@ final class Prefs {
     static Bot.Config load(Context c) {
         SharedPreferences p = c.getSharedPreferences("cfg", Context.MODE_PRIVATE);
         Bot.Config k = new Bot.Config();
-        k.castDelay = p.getFloat("castDelay", k.castDelay);
+        // "castDelay2": the old 0.45 s default (before the Lepas! power gauge, 2026-11-21) casts too short now
+        k.castDelay = p.getFloat("castDelay2", k.castDelay);
+        k.castFill = p.getFloat("castFill2", k.castFill);
         k.maxWait = p.getFloat("maxWait", k.maxWait);
         k.maxCasts = p.getInt("maxCasts", k.maxCasts);
         k.latency = p.getFloat("latency", k.latency);
@@ -25,7 +27,8 @@ final class Prefs {
 
     static void save(Context c, Bot.Config k) {
         c.getSharedPreferences("cfg", Context.MODE_PRIVATE).edit()
-                .putFloat("castDelay", k.castDelay)
+                .putFloat("castDelay2", k.castDelay)
+                .putFloat("castFill2", k.castFill)
                 .putFloat("maxWait", k.maxWait)
                 .putInt("maxCasts", k.maxCasts)
                 .putFloat("latency", k.latency)

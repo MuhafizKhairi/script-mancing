@@ -392,6 +392,114 @@ public final class Detector {
         if (!barFound && button == BTN_TARIK) findBarRelative(px, w, h);
         skyMode = gapFound = false;
         if (barFound) findWall(px, w, h);
+        gaugeFill = -1;
+        if (button == BTN_LEPAS) findCastGauge(px, w, h);
+        findCard(px, w, h);
+    }
+
+    // ------------------------------------------------------------------ catch card
+    /** Fraction of the screen centre covered by the catch card's cream (0..1); card shown when >= 0.45. */
+    public float cardFrac;
+    public boolean cardVisible;
+
+    /** The catch card ("Ketuk untuk menutup") is a big cream panel in the middle (~0.65-0.78 of this area). */
+    private void findCard(int[] px, int w, int h) {
+        int n = 0, t = 0;
+        int x0 = (int) (0.36f * w), x1 = (int) (0.64f * w), y0 = (int) (0.21f * h), y1 = (int) (0.80f * h);
+        int sx = Math.max(1, w / 160), sy = Math.max(1, h / 72);
+        for (int y = y0; y < y1; y += sy)
+            for (int x = x0; x < x1; x += sx) {
+                int c = px[y * w + x];
+                int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+                t++;
+                if (r > 235 && g > 228 && b > 205) n++;
+            }
+        cardFrac = t > 0 ? n / (float) t : 0;
+        cardVisible = cardFrac >= 0.45f;
+    }
+
+    // ------------------------------------------------------------------ "Lepas!" power gauge
+    /** "Lepas!" power gauge fill 0..1 (bottom up: red -> orange -> yellow), -1 = no gauge seen. */
+    public float gaugeFill = -1;
+    public int gaugeX, gaugeTop, gaugeBot;
+
+    private static boolean isGaugeCream(int c) {
+        int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+        return r > 228 && g > 222 && b > 190 && r - b < 50;
+    }
+
+    private static boolean isDarkPx(int c) {
+        int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+        return r < 130 && g < 130 && b < 130 && Math.abs(r - b) < 60;
+    }
+
+    /**
+     * Since 2026-11-21 "Lepas!" shows a vertical power gauge next to the player (~0.03h wide, ~0.15h tall at 640x288:
+     * dark outline, cream walls, fill rising from the bottom red -> orange -> yellow in ~1.5 s). A wall is a column of
+     * cream with dark outline just outside it; the gauge is two such walls close together (a speech bubble is wider
+     * and its inside is not dark). The fill is read in the middle column from the bottom up.
+     */
+    private void findCastGauge(int[] px, int w, int h) {
+        int xa = (int) (0.30f * w), xb = (int) (0.70f * w), ya = (int) (0.15f * h), yb = (int) (0.80f * h);
+        int minRun = Math.max(12, (int) (0.09f * h)), maxRun = (int) (0.22f * h);
+        int maxGap = Math.max(5, (int) (0.05f * h)), minGap = Math.max(3, (int) (0.012f * h));
+        for (int x = xa; x < xb; x++) {
+            // longest cream run in this column
+            int run = 0, bestLen = 0, bestEnd = -1;
+            for (int y = ya; y < yb; y++) {
+                if (isGaugeCream(px[y * w + x])) {
+                    if (++run > bestLen) {
+                        bestLen = run;
+                        bestEnd = y;
+                    }
+                } else run = 0;
+            }
+            if (bestLen < minRun || bestLen > maxRun) continue;
+            int top = bestEnd - bestLen + 1, bot = bestEnd;
+            if (!darkBeside(px, w, x, top, bot, -1)) continue;
+            // right wall
+            for (int x2 = x + minGap; x2 <= x + maxGap && x2 < w - 3; x2++) {
+                int ok = 0;
+                for (int y = top; y <= bot; y++) if (isGaugeCream(px[y * w + x2])) ok++;
+                if (ok < 0.85f * (bot - top + 1) || !darkBeside(px, w, x2, top, bot, +1)) continue;
+                // the gauge's top/bottom outline is dark too
+                if (top < 3 || bot >= h - 3) continue;
+                int m = (x + x2) / 2, mc = 0;
+                for (int dx = -1; dx <= 1; dx++)
+                    if (isDarkPx(px[(top - 2) * w + m + dx]) || isDarkPx(px[(top - 3) * w + m + dx])) mc++;
+                if (mc < 2) continue;
+                // fill: highest coloured (not cream) pixel connected to the bottom, gaps of 2 rows allowed
+                int inner0 = top + 1, inner1 = bot - 1, fillTop = inner1 + 1, miss = 0;
+                for (int y = inner1; y >= inner0; y--) {
+                    int c = px[y * w + m];
+                    int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
+                    boolean col = r > 150 && Math.min(g, b) < 200 && r - b > 40;
+                    if (col) {
+                        fillTop = y;
+                        miss = 0;
+                    } else if (++miss > 2) break;
+                }
+                gaugeFill = Math.min(1f, (inner1 + 1 - fillTop) / (float) (inner1 - inner0 + 1));
+                gaugeX = m;
+                gaugeTop = top;
+                gaugeBot = bot;
+                return;
+            }
+        }
+    }
+
+    /** Is the column just left (side -1) / right (+1) of x dark over most of top..bot? */
+    private static boolean darkBeside(int[] px, int w, int x, int top, int bot, int side) {
+        int n = 0;
+        for (int y = top; y <= bot; y++) {
+            boolean d = false;
+            for (int k = 1; k <= 2 && !d; k++) {
+                int xx = x + side * k;
+                if (xx >= 0 && xx < w && isDarkPx(px[y * w + xx])) d = true;
+            }
+            if (d) n++;
+        }
+        return n >= 0.8f * (bot - top + 1);
     }
 
     // ------------------------------------------------------------------ legendary "Rintangan!" (fish walls)
@@ -612,6 +720,11 @@ public final class Detector {
         }
     }
 
+    /** The redesigned button's thin cream outline (~214,203,179; blends darker when downscaled). */
+    private static boolean isCreamRing(int r, int g, int b) {
+        return r >= 190 && g >= 178 && b >= 150 && r >= g && g >= b && r - b <= 70;
+    }
+
     private float foundCx, foundCy;
     /** Centre of the last button whose ring was found (the button stays put). */
     private float lastRingCx, lastRingCy, lastRingR = -1;
@@ -691,7 +804,8 @@ public final class Detector {
                     int mx = Math.max(r, Math.max(g, b)), mn = Math.min(r, Math.min(g, b));
                     // cream-white outline, or the yellow progress arc that grows over it (~255,204,55);
                     // the arc's green channel keeps it apart from the orange "Lepas" fill (g~164)
-                    boolean white = mn > 200 && mx - mn < 45;
+                    // (since the 2026-11-21 redesign the ring is a thin, darker cream ~214,203,179)
+                    boolean white = mn > 200 && mx - mn < 45 || isCreamRing(r, g, b);
                     boolean arc = r > 230 && g >= 182 && g <= 228 && b < 115;
                     if (white || arc) {
                         rad[hits] = d;
@@ -742,7 +856,7 @@ public final class Detector {
                     int c = px[y * w + x];
                     int r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255;
                     int mx = Math.max(r, Math.max(g, b)), mn = Math.min(r, Math.min(g, b));
-                    boolean white = mn > 200 && mx - mn < 45, arc = r > 230 && g >= 182 && g <= 228 && b < 115;
+                    boolean white = mn > 200 && mx - mn < 45 || isCreamRing(r, g, b), arc = r > 230 && g >= 182 && g <= 228 && b < 115;
                     if ((white || arc) && run >= 3) {
                         rad[hits++] = d;
                         break;
@@ -1747,6 +1861,7 @@ public final class Detector {
 
     public String describe() {
         StringBuilder sb = new StringBuilder();
+        if (gaugeFill >= 0) sb.append("gauge=").append(Math.round(gaugeFill * 100)).append("% ");
         sb.append("btn=").append(BTN_NAMES[button]).append(" n=").append(btnDist)
                 .append(" @").append((int) btnCx).append(',').append((int) btnCy);
         if (barFound) {

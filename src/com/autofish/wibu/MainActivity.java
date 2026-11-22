@@ -42,7 +42,7 @@ public class MainActivity extends Activity {
             ui.post(() -> histSize.setText(String.format(Locale.US, "Ukuran riwayat: %.1f MB", b / 1048576f)));
         }).start();
     }
-    private EditText castDelay, maxWait, maxCasts, latency;
+    private EditText castFill, castDelay, maxWait, maxCasts, latency;
     private final Handler ui = new Handler(Looper.getMainLooper());
 
     private int dp(float v) {
@@ -136,7 +136,8 @@ public class MainActivity extends Activity {
         root.addView(st);
 
         Bot.Config cfg = Prefs.load(this);
-        castDelay = field(root, "Jeda sebelum tekan Lepas! (detik, makin lama makin jauh lemparan)", fmt(cfg.castDelay), true);
+        castFill = field(root, "Tenaga lemparan (%): 0 = langsung lempar (cepat), 80 = tahan sampai meteran 80%", String.valueOf(Math.round(cfg.castFill * 100)), false);
+        castDelay = field(root, "Jeda Lepas! kalau meteran tidak terlihat (detik)", fmt(cfg.castDelay), true);
         maxWait = field(root, "Maks. menunggu ikan sebelum angkat & lempar ulang (detik, 0 = tidak pernah)", fmt(cfg.maxWait), true);
         maxCasts = field(root, "Berhenti setelah N kali lempar (0 = tanpa batas)", String.valueOf(cfg.maxCasts), false);
         latency = field(root, "Kompensasi delay (detik). Naikkan jika zona sering kelewatan, turunkan jika telat", fmt(cfg.latency), true);
@@ -209,6 +210,7 @@ public class MainActivity extends Activity {
     private void saveSettings() {
         Bot.Config cfg = Prefs.load(this);
         try {
+            cfg.castFill = Math.max(0f, Math.min(1f, Integer.parseInt(castFill.getText().toString()) / 100f));
             cfg.castDelay = Float.parseFloat(castDelay.getText().toString());
             cfg.maxWait = Float.parseFloat(maxWait.getText().toString());
             cfg.maxCasts = Integer.parseInt(maxCasts.getText().toString());
